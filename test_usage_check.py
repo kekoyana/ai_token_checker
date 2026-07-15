@@ -37,12 +37,16 @@ class FormattingTests(unittest.TestCase):
         output = StringIO()
         with redirect_stdout(output):
             print_table(results)
-        self.assertIn("概算残量順位: claude (310pt) > codex (92pt)", output.getvalue())
+        self.assertIn("概算残量順位: claude (415pt) > codex (92pt)", output.getvalue())
         self.assertIn("8.0%", output.getvalue())
 
     def test_estimated_left_uses_rough_plan_points(self):
-        self.assertEqual(estimated_left_text("claude", "max_5x", 62.0), ("約310pt (多)", 310.0))
+        self.assertEqual(estimated_left_text("claude", "max_5x", 100.0, "5時間"), ("約125pt (中)", 125.0))
+        self.assertEqual(estimated_left_text("claude", "max_5x", 62.0, "7日"), ("約415pt (非常に多)", 415.4))
         self.assertEqual(estimated_left_text("agy", "AI Pro", 100.0), ("約100pt (中)", 100.0))
+
+    def test_full_window_without_reset_is_marked_full(self):
+        self.assertEqual(pace_text({"remaining_percent": 100.0, "resets_at": None, "window_minutes": 300}), "満タン")
 
     def test_pace_projects_usage_to_reset(self):
         now = datetime(2026, 7, 16, tzinfo=timezone.utc)

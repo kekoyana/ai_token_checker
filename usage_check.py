@@ -295,8 +295,36 @@ def capacity_points(service: str, plan: Any) -> float:
     return float(CAPACITY_POINTS.get(service, {}).get(key, 100))
 
 
-def estimated_left_text(service: str, plan: Any, remaining_percent: float) -> tuple[str, float]:
+def claude_window_points(plan: Any, limit_name: str, remaining_percent: float) -> float | None:
+    """Convert Anthropic's published prompt/hour ranges into rough common points."""
+    label = capacity_text("claude", plan)
+    five_hour = {"Pro 1x": (10, 40), "Max 5x": (50, 200), "Max 20x": (200, 800)}
+    weekly_sonnet = {"Pro 1x": (40, 80), "Max 5x": (140, 280), "Max 20x": (240, 480)}
+    weekly_opus = {"Max 5x": (15, 35), "Max 20x": (24, 40)}
+    fraction = remaining_percent / 100.0
+
+    def midpoint(values: tuple[int, int]) -> float:
+        return (values[0] + values[1]) / 2.0
+
+    if limit_name == "5時間" and label in five_hour:
+        return midpoint(five_hour[label]) * fraction
+    if limit_name.startswith("7日"):
+        points = 0.0
+        if "Opus" not in limit_name and label in weekly_sonnet:
+            points += midpoint(weekly_sonnet[label]) * 2.0
+        if "Sonnet" not in limit_name and label in weekly_opus:
+            points += midpoint(weekly_opus[label]) * 10.0
+        if points:
+            return points * fraction
+    return None
+
+
+def estimated_left_text(service: str, plan: Any, remaining_percent: float, limit_name: str = "") -> tuple[str, float]:
     points = capacity_points(service, plan) * remaining_percent / 100.0
+    if service == "claude":
+        window_points = claude_window_points(plan, limit_name, remaining_percent)
+        if window_points is not None:
+            points = window_points
     if points < 20:
         grade = "ごく少"
     elif points < 60:
@@ -324,6 +352,8 @@ def parse_reset_datetime(value: Any) -> datetime | None:
 def pace_text(row: dict[str, Any], now: datetime | None = None) -> str:
     reset = parse_reset_datetime(row.get("resets_at"))
     duration = row.get("window_minutes")
+    if reset is None and float(row.get("remaining_percent", 0)) >= 99.9:
+        return "満タン"
     if reset is None or not duration:
         return "不明"
     now = now or datetime.now().astimezone()
@@ -375,14 +405,14 @@ def print_table(results: list[dict[str, Any]]) -> None:
         for row in rows:
             remaining = row["remaining_percent"]
             used = 100.0 - remaining
-            estimate, points = estimated_left_text(result["service"], result.get("plan"), remaining)
+            estimate, points = estimated_left_text(result["service"], result.get("plan"), remaining, str(row["name"]))
             service_scores.setdefault(result["service"], []).append(points)
             print(f"{result['service']:<9} {str(row['name']):<28.28} {plan:<14.14} {used:>6.1f}% {remaining:>7.1f}%  {reset_text(row.get('resets_at')):<12} {pace_text(row):<12} {estimate}")
-    scores = {service: min(values) for service, values in service_scores.items() if values}
+    scores = {service: sum(values) / len(values) for service, values in service_scores.items() if values}
     if len(scores) > 1:
         ranking = " > ".join(f"{service} ({score:.0f}pt)" for service, score in sorted(scores.items(), key=lambda item: item[1], reverse=True))
         print(f"\n概算残量順位: {ranking}")
-    print("※ pt・順位・PACEはプラン倍率と一定消費を仮定した参考推定で、実際のトークン数・回数ではありません。")
+    print("※ Claudeは公表目安を5h=プロンプト中央値、週次=Sonnet 2pt/h・Opus 10pt/hで換算。順位は各枠平均の参考推定です。")
 
 
 def main() -> int:
