@@ -118,7 +118,8 @@ def claude_credentials() -> dict[str, Any]:
 
 def claude_usage() -> dict[str, Any]:
     try:
-        token = claude_credentials().get("accessToken")
+        credentials = claude_credentials()
+        token = credentials.get("accessToken")
         if not token:
             raise RuntimeError("Claude Codeのアクセストークンがありません")
         request = urllib.request.Request(
@@ -135,7 +136,9 @@ def claude_usage() -> dict[str, Any]:
                 continue
             used = float(item.get("utilization", 0))
             windows.append({"name": label, "remaining_percent": max(0.0, 100.0 - used), "used_percent": used, "resets_at": item.get("resets_at")})
-        return {"service": "claude", "ok": True, "windows": windows}
+        plan_parts = [credentials.get("subscriptionType"), credentials.get("rateLimitTier")]
+        plan = " ".join(str(part) for part in plan_parts if part)
+        return {"service": "claude", "ok": True, "plan": plan, "windows": windows}
     except urllib.error.HTTPError as exc:
         return error("claude", f"APIエラー HTTP {exc.code}")
     except Exception as exc:
@@ -168,7 +171,7 @@ def agy_usage() -> dict[str, Any]:
                     windows.append({"name": name, "remaining_percent": remaining, "resets_at": reset})
             if not windows:
                 raise RuntimeError("使用枠のJSONにモデル情報がありません")
-            return {"service": "agy", "ok": True, "windows": windows}
+            return {"service": "agy", "ok": True, "plan": raw.get("planType"), "windows": windows}
         except Exception as exc:
             return error("agy", str(exc))
 
@@ -218,12 +221,99 @@ def flatten_agy(value: Any, path: str = "") -> list[tuple[str, float, Any]]:
     return found
 
 
+def capacity_text(service: str, plan: Any) -> str:
+    """Return the most specific safe plan/capacity label available."""
+    if not plan:
+        return "不明"
+    normalized = str(plan).lower().replace("-", "_").replace(" ", "_")
+    if service == "claude":
+        if "20x" in normalized:
+            return "Max 20x"
+        if "5x" in normalized:
+            return "Max 5x"
+        if "pro" in normalized:
+            return "Pro 1x"
+        if "free" in normalized:
+            return "Free"
+        if "team" in normalized:
+            return "Team"
+        if "enterprise" in normalized:
+            return "Enterprise"
+        if "max" in normalized:
+            return "Max (倍率不明)"
+    elif service == "agy":
+        if "20x" in normalized or "ultra_200" in normalized:
+            return "Ultra 20x"
+        if "5x" in normalized or "ultra_100" in normalized:
+            return "Ultra 5x"
+        if "pro" in normalized:
+            return "Pro 1x"
+        if "free" in normalized:
+            return "Free"
+        if "ultra" in normalized:
+            return "Ultra (倍率不明)"
+        if "enterprise" in normalized:
+            return "Enterprise"
+    elif service == "codex":
+        if "enterprise" in normalized:
+            return "Enterprise"
+        if "business" in normalized or "team" in normalized:
+            return "Business"
+        if "pro" in normalized:
+            return "Pro"
+        if "plus" in normalized:
+            return "Plus"
+        if "go" in normalized:
+            return "Go"
+        if "free" in normalized:
+            return "Free"
+        if "edu" in normalized:
+            return "Edu"
+    return "不明"
+
+
+def remaining_size_text(service: str, plan: Any, remaining_percent: float) -> str:
+    """Estimate remaining capacity in service-specific baseline-plan units."""
+    label = capacity_text(service, plan)
+    normalized = str(plan or "").lower().replace("-", "_").replace(" ", "_")
+    multiplier: float | None = None
+    if service in ("claude", "agy"):
+        if "20x" in normalized or "ultra_200" in normalized:
+            multiplier = 20.0
+        elif "5x" in normalized or "ultra_100" in normalized:
+            multiplier = 5.0
+        elif "pro" in normalized:
+            multiplier = 1.0
+
+    if multiplier is None:
+        return f"{label}枠の{remaining_percent:.1f}%" if label != "不明" else "算出不可"
+
+    baseline_units = multiplier * remaining_percent / 100.0
+    if baseline_units == 0:
+        size = "なし"
+    elif baseline_units < 0.1:
+        size = "ごくわずか"
+    elif baseline_units < 0.3:
+        size = "少ない"
+    elif baseline_units < 0.75:
+        size = "やや少ない"
+    elif baseline_units < 1.5:
+        size = "標準的"
+    elif baseline_units < 3:
+        size = "やや多い"
+    elif baseline_units < 10:
+        size = "多い"
+    else:
+        size = "非常に多い"
+    return f"約{baseline_units:.1f}基準枠 ({size})"
+
+
 def print_table(results: list[dict[str, Any]]) -> None:
-    print(f"{'SERVICE':<9} {'LIMIT':<28} {'REMAINING':>10}  RESET")
-    print("-" * 66)
+    print(f"{'SERVICE':<9} {'LIMIT':<28} {'EST. LEFT':<24} {'REMAINING':>10}  RESET")
+    print("-" * 91)
     for result in results:
         if not result["ok"]:
-            print(f"{result['service']:<9} {'ERROR':<28} {'-':>10}  {result['error']}")
+            print(f"{result['service']:<9} {'ERROR':<28} {'-':<24} {'-':>10}  {result['error']}")
             continue
         rows = result.get("windows", [])
         if result["service"] == "agy" and "data" in result:
@@ -231,7 +321,8 @@ def print_table(results: list[dict[str, Any]]) -> None:
         if not rows:
             print(f"{result['service']:<9} {'取得済み（表示可能な枠なし）':<28}")
         for row in rows:
-            print(f"{result['service']:<9} {str(row['name']):<28.28} {row['remaining_percent']:>9.1f}%  {reset_text(row.get('resets_at'))}")
+            estimated = remaining_size_text(result["service"], result.get("plan"), row["remaining_percent"])
+            print(f"{result['service']:<9} {str(row['name']):<28.28} {estimated:<24.24} {row['remaining_percent']:>9.1f}%  {reset_text(row.get('resets_at'))}")
 
 
 def main() -> int:

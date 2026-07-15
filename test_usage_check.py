@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from usage_check import agy_usage, flatten_agy, reset_text
+from usage_check import agy_usage, capacity_text, flatten_agy, remaining_size_text, reset_text
 
 
 class FormattingTests(unittest.TestCase):
@@ -16,6 +16,20 @@ class FormattingTests(unittest.TestCase):
 
     def test_unknown_reset(self):
         self.assertEqual(reset_text("quota available"), "quota available")
+
+    def test_capacity_classes(self):
+        self.assertEqual(capacity_text("claude", "max_20x"), "Max 20x")
+        self.assertEqual(capacity_text("claude", "max_5x"), "Max 5x")
+        self.assertEqual(capacity_text("claude", "pro"), "Pro 1x")
+        self.assertEqual(capacity_text("agy", "ultra"), "Ultra (倍率不明)")
+        self.assertEqual(capacity_text("codex", "plus"), "Plus")
+        self.assertEqual(capacity_text("codex", None), "不明")
+
+    def test_remaining_size_uses_plan_multiplier(self):
+        self.assertEqual(remaining_size_text("claude", "max_20x", 99.0), "約19.8基準枠 (非常に多い)")
+        self.assertEqual(remaining_size_text("claude", "max_5x", 50.0), "約2.5基準枠 (やや多い)")
+        self.assertEqual(remaining_size_text("agy", "pro", 25.0), "約0.2基準枠 (少ない)")
+        self.assertEqual(remaining_size_text("codex", "plus", 96.0), "Plus枠の96.0%")
 
 
 class AgyUsageTests(unittest.TestCase):
