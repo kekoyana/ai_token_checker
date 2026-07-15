@@ -12,12 +12,21 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 
 TIMEOUT = 20
+LOCAL_CONFIG = ".usage_check.local.json"
+
+# Deliberately rough, cross-service capacity points. These are comparison aids,
+# not vendor-published token or request limits.
+CAPACITY_POINTS = {
+    "codex": {"free": 20, "go": 50, "plus": 100, "pro": 1000, "business": 250, "enterprise": 1000, "edu": 250},
+    "claude": {"free": 20, "pro": 100, "max_5x": 500, "max_20x": 2000, "team": 500, "enterprise": 1000},
+    "agy": {"free": 20, "ai_pro": 100, "pro": 100, "ultra_5x": 500, "ultra_20x": 2000, "enterprise": 1000},
+}
 
 
 def error(service: str, message: str) -> dict[str, Any]:
@@ -135,7 +144,8 @@ def claude_usage() -> dict[str, Any]:
             if not item:
                 continue
             used = float(item.get("utilization", 0))
-            windows.append({"name": label, "remaining_percent": max(0.0, 100.0 - used), "used_percent": used, "resets_at": item.get("resets_at")})
+            duration = 300 if key == "five_hour" else 10080 if key.startswith("seven_day") else None
+            windows.append({"name": label, "remaining_percent": max(0.0, 100.0 - used), "used_percent": used, "resets_at": item.get("resets_at"), "window_minutes": duration})
         plan_parts = [credentials.get("subscriptionType"), credentials.get("rateLimitTier")]
         plan = " ".join(str(part) for part in plan_parts if part)
         return {"service": "claude", "ok": True, "plan": plan, "windows": windows}
@@ -168,7 +178,7 @@ def agy_usage() -> dict[str, Any]:
                 identity = (str(name), remaining, reset)
                 if identity not in seen_windows:
                     seen_windows.add(identity)
-                    windows.append({"name": name, "remaining_percent": remaining, "resets_at": reset})
+                    windows.append({"name": name, "remaining_percent": remaining, "resets_at": reset, "window_minutes": 300})
             if not windows:
                 raise RuntimeError("使用枠のJSONにモデル情報がありません")
             return {"service": "agy", "ok": True, "plan": raw.get("planType"), "windows": windows}
@@ -246,6 +256,8 @@ def capacity_text(service: str, plan: Any) -> str:
             return "Ultra 20x"
         if "5x" in normalized or "ultra_100" in normalized:
             return "Ultra 5x"
+        if "ai_pro" in normalized:
+            return "AI Pro"
         if "pro" in normalized:
             return "Pro 1x"
         if "free" in normalized:
@@ -272,57 +284,105 @@ def capacity_text(service: str, plan: Any) -> str:
     return "不明"
 
 
-def remaining_size_text(service: str, plan: Any, remaining_percent: float) -> str:
-    """Estimate remaining capacity in service-specific baseline-plan units."""
-    label = capacity_text(service, plan)
-    normalized = str(plan or "").lower().replace("-", "_").replace(" ", "_")
-    multiplier: float | None = None
-    if service in ("claude", "agy"):
-        if "20x" in normalized or "ultra_200" in normalized:
-            multiplier = 20.0
-        elif "5x" in normalized or "ultra_100" in normalized:
-            multiplier = 5.0
-        elif "pro" in normalized:
-            multiplier = 1.0
+def capacity_points(service: str, plan: Any) -> float:
+    """Return deliberately rough full-quota points for cross-service comparison."""
+    label = capacity_text(service, plan).lower().replace(" ", "_")
+    aliases = {
+        "pro_1x": "pro", "max_5x": "max_5x", "max_20x": "max_20x",
+        "ultra_5x": "ultra_5x", "ultra_20x": "ultra_20x",
+    }
+    key = aliases.get(label, label)
+    return float(CAPACITY_POINTS.get(service, {}).get(key, 100))
 
-    if multiplier is None:
-        return f"{label}枠の{remaining_percent:.1f}%" if label != "不明" else "算出不可"
 
-    baseline_units = multiplier * remaining_percent / 100.0
-    if baseline_units == 0:
-        size = "なし"
-    elif baseline_units < 0.1:
-        size = "ごくわずか"
-    elif baseline_units < 0.3:
-        size = "少ない"
-    elif baseline_units < 0.75:
-        size = "やや少ない"
-    elif baseline_units < 1.5:
-        size = "標準的"
-    elif baseline_units < 3:
-        size = "やや多い"
-    elif baseline_units < 10:
-        size = "多い"
+def estimated_left_text(service: str, plan: Any, remaining_percent: float) -> tuple[str, float]:
+    points = capacity_points(service, plan) * remaining_percent / 100.0
+    if points < 20:
+        grade = "ごく少"
+    elif points < 60:
+        grade = "少"
+    elif points < 150:
+        grade = "中"
+    elif points < 400:
+        grade = "多"
     else:
-        size = "非常に多い"
-    return f"約{baseline_units:.1f}基準枠 ({size})"
+        grade = "非常に多"
+    return f"約{points:.0f}pt ({grade})", points
+
+
+def parse_reset_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value).astimezone()
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+
+
+def pace_text(row: dict[str, Any], now: datetime | None = None) -> str:
+    reset = parse_reset_datetime(row.get("resets_at"))
+    duration = row.get("window_minutes")
+    if reset is None or not duration:
+        return "不明"
+    now = now or datetime.now().astimezone()
+    total = timedelta(minutes=float(duration))
+    time_left = reset - now
+    elapsed_fraction = 1.0 - time_left / total
+    used = 100.0 - float(row["remaining_percent"])
+    if time_left.total_seconds() <= 0:
+        return "更新待ち"
+    if used <= 0.1:
+        return "余裕あり"
+    if elapsed_fraction <= 0.05:
+        return "計測初期"
+    projected_used = used / max(0.01, elapsed_fraction)
+    if projected_used <= 70:
+        return "余裕あり"
+    if projected_used <= 100:
+        return "持つ見込み"
+    if projected_used <= 125:
+        return "やや速い"
+    return "枯渇懸念"
+
+
+def load_local_config() -> dict[str, Any]:
+    path = Path.cwd() / LOCAL_CONFIG
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def print_table(results: list[dict[str, Any]]) -> None:
-    print(f"{'SERVICE':<9} {'LIMIT':<28} {'EST. LEFT':<24} {'REMAINING':>10}  RESET")
-    print("-" * 91)
+    print(f"{'SERVICE':<9} {'LIMIT':<28} {'PLAN':<14} {'USED':>7} {'REMAIN':>8}  {'RESET':<12} {'PACE':<12} EST. LEFT")
+    print("-" * 116)
+    service_scores: dict[str, list[float]] = {}
     for result in results:
         if not result["ok"]:
-            print(f"{result['service']:<9} {'ERROR':<28} {'-':<24} {'-':>10}  {result['error']}")
+            print(f"{result['service']:<9} {'ERROR':<28} {'-':<14} {'-':>7} {'-':>8}  {'-':<12} {'-':<12} {result['error']}")
             continue
+        plan = capacity_text(result["service"], result.get("plan"))
         rows = result.get("windows", [])
         if result["service"] == "agy" and "data" in result:
             rows = [{"name": n, "remaining_percent": p, "resets_at": r} for n, p, r in flatten_agy(result["data"])]
         if not rows:
             print(f"{result['service']:<9} {'取得済み（表示可能な枠なし）':<28}")
         for row in rows:
-            estimated = remaining_size_text(result["service"], result.get("plan"), row["remaining_percent"])
-            print(f"{result['service']:<9} {str(row['name']):<28.28} {estimated:<24.24} {row['remaining_percent']:>9.1f}%  {reset_text(row.get('resets_at'))}")
+            remaining = row["remaining_percent"]
+            used = 100.0 - remaining
+            estimate, points = estimated_left_text(result["service"], result.get("plan"), remaining)
+            service_scores.setdefault(result["service"], []).append(points)
+            print(f"{result['service']:<9} {str(row['name']):<28.28} {plan:<14.14} {used:>6.1f}% {remaining:>7.1f}%  {reset_text(row.get('resets_at')):<12} {pace_text(row):<12} {estimate}")
+    scores = {service: min(values) for service, values in service_scores.items() if values}
+    if len(scores) > 1:
+        ranking = " > ".join(f"{service} ({score:.0f}pt)" for service, score in sorted(scores.items(), key=lambda item: item[1], reverse=True))
+        print(f"\n概算残量順位: {ranking}")
+    print("※ pt・順位・PACEはプラン倍率と一定消費を仮定した参考推定で、実際のトークン数・回数ではありません。")
 
 
 def main() -> int:
@@ -333,6 +393,11 @@ def main() -> int:
     selected = args.service or ["codex", "claude", "agy"]
     checkers = {"codex": codex_usage, "claude": claude_usage, "agy": agy_usage}
     results = [checkers[name]() for name in selected]
+    plans = load_local_config().get("plans", {})
+    if isinstance(plans, dict):
+        for result in results:
+            if result.get("ok") and plans.get(result["service"]):
+                result["plan"] = plans[result["service"]]
     if args.json:
         print(json.dumps({"checked_at": datetime.now().astimezone().isoformat(), "services": results}, ensure_ascii=False, indent=2))
     else:

@@ -1,8 +1,11 @@
 import json
 import unittest
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
+from io import StringIO
 from unittest.mock import patch
 
-from usage_check import agy_usage, capacity_text, flatten_agy, remaining_size_text, reset_text
+from usage_check import agy_usage, capacity_text, estimated_left_text, flatten_agy, pace_text, print_table, reset_text
 
 
 class FormattingTests(unittest.TestCase):
@@ -22,14 +25,29 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(capacity_text("claude", "max_5x"), "Max 5x")
         self.assertEqual(capacity_text("claude", "pro"), "Pro 1x")
         self.assertEqual(capacity_text("agy", "ultra"), "Ultra (倍率不明)")
+        self.assertEqual(capacity_text("agy", "AI Pro"), "AI Pro")
         self.assertEqual(capacity_text("codex", "plus"), "Plus")
         self.assertEqual(capacity_text("codex", None), "不明")
 
-    def test_remaining_size_uses_plan_multiplier(self):
-        self.assertEqual(remaining_size_text("claude", "max_20x", 99.0), "約19.8基準枠 (非常に多い)")
-        self.assertEqual(remaining_size_text("claude", "max_5x", 50.0), "約2.5基準枠 (やや多い)")
-        self.assertEqual(remaining_size_text("agy", "pro", 25.0), "約0.2基準枠 (少ない)")
-        self.assertEqual(remaining_size_text("codex", "plus", 96.0), "Plus枠の96.0%")
+    def test_cross_service_estimated_ranking_is_printed(self):
+        results = [
+            {"service": "codex", "ok": True, "plan": "plus", "windows": [{"name": "primary", "remaining_percent": 92.0}]},
+            {"service": "claude", "ok": True, "plan": "max_5x", "windows": [{"name": "7日", "remaining_percent": 62.0}]},
+        ]
+        output = StringIO()
+        with redirect_stdout(output):
+            print_table(results)
+        self.assertIn("概算残量順位: claude (310pt) > codex (92pt)", output.getvalue())
+        self.assertIn("8.0%", output.getvalue())
+
+    def test_estimated_left_uses_rough_plan_points(self):
+        self.assertEqual(estimated_left_text("claude", "max_5x", 62.0), ("約310pt (多)", 310.0))
+        self.assertEqual(estimated_left_text("agy", "AI Pro", 100.0), ("約100pt (中)", 100.0))
+
+    def test_pace_projects_usage_to_reset(self):
+        now = datetime(2026, 7, 16, tzinfo=timezone.utc)
+        row = {"remaining_percent": 62.0, "resets_at": "2026-07-21T00:00:00Z", "window_minutes": 10080}
+        self.assertEqual(pace_text(row, now), "枯渇懸念")
 
 
 class AgyUsageTests(unittest.TestCase):
