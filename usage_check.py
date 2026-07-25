@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show remaining usage for Codex, Claude Code, and Antigravity CLI."""
+"""Show remaining usage for Codex, Claude Code, Antigravity CLI, and Grok Build."""
 
 from __future__ import annotations
 
@@ -11,14 +11,20 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 
 TIMEOUT = 20
 LOCAL_CONFIG = ".usage_check.local.json"
+GROK_AUTH_FILE = Path.home() / ".grok" / "auth.json"
+GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing"
+GROK_SUBSCRIPTIONS_URL = "https://grok.com/rest/subscriptions"
+GROK_OIDC_TOKEN_URL = "https://auth.x.ai/oauth2/token"
+GROK_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 
 # Deliberately rough, cross-service capacity points. These are comparison aids,
 # not vendor-published token or request limits.
@@ -26,6 +32,17 @@ CAPACITY_POINTS = {
     "codex": {"free": 20, "go": 50, "plus": 100, "pro": 1000, "business": 250, "enterprise": 1000, "edu": 250},
     "claude": {"free": 20, "pro": 100, "max_5x": 500, "max_20x": 2000, "team": 500, "enterprise": 1000},
     "agy": {"free": 20, "ai_pro": 100, "pro": 100, "ultra_5x": 500, "ultra_20x": 2000, "enterprise": 1000},
+    "grok": {
+        "free": 20,
+        "x_basic": 20,
+        "lite": 50,
+        "supergrok_lite": 50,
+        "supergrok": 100,
+        "x_premium": 100,
+        "x_premium_plus": 150,
+        "heavy": 1000,
+        "supergrok_heavy": 1000,
+    },
 }
 
 
@@ -201,6 +218,302 @@ def agy_usage() -> dict[str, Any]:
         return error("agy", str(exc))
 
 
+def grok_number(value: Any) -> float | None:
+    """Extract a numeric field from Grok billing payloads (`{"val": n}` or bare number)."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        if "val" in value and value["val"] is not None:
+            return float(value["val"])
+        if "value" in value and value["value"] is not None:
+            return float(value["value"])
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def grok_percent(value: Any) -> float | None:
+    """Normalize a percent-like value to 0–100.
+
+    Grok sometimes returns fractions (0–1) and sometimes whole percents (0–100).
+    Values above 1.5 are treated as already-scaled percents.
+    """
+    number = grok_number(value)
+    if number is None:
+        return None
+    if 0.0 <= number <= 1.5:
+        return max(0.0, min(100.0, number * 100.0))
+    return max(0.0, min(100.0, number))
+
+
+def grok_period_label(period: Any) -> str:
+    if not isinstance(period, dict):
+        return "クレジット"
+    period_type = str(period.get("type") or "").upper()
+    if "WEEKLY" in period_type:
+        return "週間"
+    if "MONTHLY" in period_type:
+        return "月間"
+    if "DAILY" in period_type:
+        return "日次"
+    return "クレジット"
+
+
+def grok_period_minutes(period: Any, start: Any, end: Any) -> int | None:
+    start_dt = parse_reset_datetime(start)
+    end_dt = parse_reset_datetime(end)
+    if start_dt is not None and end_dt is not None and end_dt > start_dt:
+        return max(1, int((end_dt - start_dt).total_seconds() / 60))
+    if isinstance(period, dict):
+        period_type = str(period.get("type") or "").upper()
+        if "WEEKLY" in period_type:
+            return 10080
+        if "MONTHLY" in period_type:
+            return 43200
+        if "DAILY" in period_type:
+            return 1440
+    return None
+
+
+def grok_plan_from_tier(tier: Any) -> str | None:
+    if not tier:
+        return None
+    text = str(tier).strip()
+    if not text:
+        return None
+    normalized = text.upper().replace("-", "_").replace(" ", "_")
+    if normalized.startswith("SUBSCRIPTION_TIER_"):
+        normalized = normalized[len("SUBSCRIPTION_TIER_"):]
+    return normalized.lower()
+
+
+def grok_auth_entries() -> list[dict[str, Any]]:
+    if not GROK_AUTH_FILE.exists():
+        return []
+    try:
+        raw = json.loads(GROK_AUTH_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    entries: list[dict[str, Any]] = []
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        entry = dict(value)
+        entry.setdefault("_auth_key", key)
+        entries.append(entry)
+    return entries
+
+
+def grok_pick_auth_entry() -> dict[str, Any]:
+    entries = grok_auth_entries()
+    if not entries:
+        raise RuntimeError("GrokのOAuth認証情報が見つかりません（grok loginを実行してください）")
+
+    def sort_key(entry: dict[str, Any]) -> tuple[int, float]:
+        expires = parse_reset_datetime(entry.get("expires_at"))
+        exp_ts = expires.timestamp() if expires is not None else 0.0
+        has_token = 1 if entry.get("key") or entry.get("access_token") else 0
+        return (has_token, exp_ts)
+
+    return max(entries, key=sort_key)
+
+
+def grok_token_expired(entry: dict[str, Any], skew_seconds: int = 120) -> bool:
+    expires = parse_reset_datetime(entry.get("expires_at"))
+    if expires is None:
+        return False
+    now = datetime.now(timezone.utc)
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires <= now + timedelta(seconds=skew_seconds)
+
+
+def grok_refresh_access_token(entry: dict[str, Any]) -> str:
+    refresh_token = entry.get("refresh_token")
+    if not refresh_token:
+        raise RuntimeError("Grokのリフレッシュトークンがありません（grok loginを実行してください）")
+    client_id = entry.get("oidc_client_id") or GROK_DEFAULT_CLIENT_ID
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }).encode()
+    request = urllib.request.Request(
+        GROK_OIDC_TOKEN_URL,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        payload = json.load(response)
+    token = payload.get("access_token")
+    if not token:
+        raise RuntimeError("Grokのアクセストークン更新に失敗しました")
+    # Keep the refreshed token in-memory only; never write secrets back to disk.
+    entry["key"] = token
+    expires_in = payload.get("expires_in")
+    if isinstance(expires_in, (int, float)):
+        entry["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=float(expires_in))).isoformat()
+    if payload.get("refresh_token"):
+        entry["refresh_token"] = payload["refresh_token"]
+    return str(token)
+
+
+def grok_access_token() -> tuple[str, dict[str, Any] | None]:
+    env_token = os.environ.get("GROK_ACCESS_TOKEN") or os.environ.get("XAI_ACCESS_TOKEN")
+    if env_token:
+        return env_token, None
+    entry = grok_pick_auth_entry()
+    token = entry.get("key") or entry.get("access_token")
+    if token and not grok_token_expired(entry):
+        return str(token), entry
+    if entry.get("refresh_token"):
+        return grok_refresh_access_token(entry), entry
+    if token:
+        return str(token), entry
+    raise RuntimeError("Grokのアクセストークンがありません（grok loginを実行してください）")
+
+
+def grok_request_json(url: str, token: str, query: dict[str, str] | None = None) -> dict[str, Any]:
+    if query:
+        url = f"{url}?{urllib.parse.urlencode(query)}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "usage-check/0.1",
+            "x-grok-client-mode": "cli",
+            "x-grok-client-surface": "grok-build",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        raw = json.load(response)
+    if not isinstance(raw, dict):
+        raise RuntimeError("Grok APIの応答形式が不正です")
+    return raw
+
+
+def grok_billing_windows(credits_config: dict[str, Any], dollars_config: dict[str, Any]) -> list[dict[str, Any]]:
+    windows: list[dict[str, Any]] = []
+    period = credits_config.get("currentPeriod")
+    period_end = None
+    period_start = None
+    if isinstance(period, dict):
+        period_end = period.get("end") or credits_config.get("billingPeriodEnd")
+        period_start = period.get("start") or credits_config.get("billingPeriodStart")
+    else:
+        period_end = credits_config.get("billingPeriodEnd") or dollars_config.get("billingPeriodEnd")
+        period_start = credits_config.get("billingPeriodStart") or dollars_config.get("billingPeriodStart")
+    period_minutes = grok_period_minutes(period, period_start, period_end)
+    label = grok_period_label(period)
+
+    used_percent = grok_percent(credits_config.get("creditUsagePercent"))
+    if used_percent is None:
+        monthly_limit = grok_number(dollars_config.get("monthlyLimit"))
+        monthly_used = grok_number(dollars_config.get("used"))
+        if monthly_limit is not None and monthly_limit > 0 and monthly_used is not None:
+            used_percent = max(0.0, min(100.0, (monthly_used / monthly_limit) * 100.0))
+            label = "月間"
+            period_end = dollars_config.get("billingPeriodEnd") or period_end
+            period_start = dollars_config.get("billingPeriodStart") or period_start
+            period_minutes = grok_period_minutes(None, period_start, period_end) or 43200
+
+    if used_percent is not None:
+        windows.append({
+            "name": label,
+            "remaining_percent": max(0.0, 100.0 - used_percent),
+            "used_percent": used_percent,
+            "resets_at": period_end,
+            "window_minutes": period_minutes,
+        })
+
+    on_demand_cap = grok_number(credits_config.get("onDemandCap"))
+    if on_demand_cap is None:
+        on_demand_cap = grok_number(dollars_config.get("onDemandCap"))
+    on_demand_used = grok_number(credits_config.get("onDemandUsed"))
+    if on_demand_used is None:
+        on_demand_used = grok_number(dollars_config.get("onDemandUsed"))
+    if on_demand_cap is not None and on_demand_cap > 0 and on_demand_used is not None:
+        used = max(0.0, min(100.0, (on_demand_used / on_demand_cap) * 100.0))
+        windows.append({
+            "name": "従量",
+            "remaining_percent": max(0.0, 100.0 - used),
+            "used_percent": used,
+            "resets_at": period_end or dollars_config.get("billingPeriodEnd"),
+            "window_minutes": period_minutes or grok_period_minutes(None, dollars_config.get("billingPeriodStart"), dollars_config.get("billingPeriodEnd")),
+        })
+
+    return windows
+
+
+def grok_subscription_plan(token: str) -> str | None:
+    try:
+        raw = grok_request_json(GROK_SUBSCRIPTIONS_URL, token)
+    except Exception:
+        return None
+    subscriptions = raw.get("subscriptions")
+    if not isinstance(subscriptions, list):
+        return None
+    for item in subscriptions:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").upper()
+        if status and "ACTIVE" not in status and "TRIAL" not in status:
+            continue
+        plan = grok_plan_from_tier(item.get("tier"))
+        if plan:
+            return plan
+    for item in subscriptions:
+        if isinstance(item, dict):
+            plan = grok_plan_from_tier(item.get("tier"))
+            if plan:
+                return plan
+    return None
+
+
+def grok_usage() -> dict[str, Any]:
+    try:
+        token, _entry = grok_access_token()
+
+        def fetch_all(access_token: str) -> tuple[dict[str, Any], dict[str, Any], str | None]:
+            credits = grok_request_json(GROK_BILLING_URL, access_token, {"format": "credits"})
+            try:
+                dollars = grok_request_json(GROK_BILLING_URL, access_token)
+            except Exception:
+                dollars = {}
+            plan = grok_subscription_plan(access_token)
+            return credits, dollars, plan
+
+        try:
+            credits_raw, dollars_raw, plan = fetch_all(token)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                raise
+            # Access token may be stale even if expires_at still looks valid.
+            entry = _entry or grok_pick_auth_entry()
+            token = grok_refresh_access_token(entry)
+            credits_raw, dollars_raw, plan = fetch_all(token)
+
+        credits_config = credits_raw.get("config") if isinstance(credits_raw.get("config"), dict) else credits_raw
+        dollars_config = dollars_raw.get("config") if isinstance(dollars_raw.get("config"), dict) else dollars_raw
+        if not isinstance(credits_config, dict):
+            credits_config = {}
+        if not isinstance(dollars_config, dict):
+            dollars_config = {}
+
+        plan = plan or grok_plan_from_tier(credits_config.get("subscription_tier") or dollars_config.get("subscription_tier"))
+        windows = grok_billing_windows(credits_config, dollars_config)
+        return {"service": "grok", "ok": True, "plan": plan, "windows": windows}
+    except urllib.error.HTTPError as exc:
+        return error("grok", f"APIエラー HTTP {exc.code}")
+    except Exception as exc:
+        return error("grok", str(exc))
+
+
 def reset_text(value: Any) -> str:
     if value is None:
         return "-"
@@ -281,6 +594,21 @@ def capacity_text(service: str, plan: Any) -> str:
             return "Free"
         if "edu" in normalized:
             return "Edu"
+    elif service == "grok":
+        if "heavy" in normalized:
+            return "SuperGrok Heavy"
+        if "lite" in normalized:
+            return "SuperGrok Lite"
+        if "supergrok" in normalized or normalized == "super":
+            return "SuperGrok"
+        if "premium_plus" in normalized or "x_premium_plus" in normalized:
+            return "X Premium+"
+        if "premium" in normalized:
+            return "X Premium"
+        if "basic" in normalized or "x_basic" in normalized:
+            return "X Basic"
+        if "free" in normalized:
+            return "Free"
     return "不明"
 
 
@@ -290,6 +618,9 @@ def capacity_points(service: str, plan: Any) -> float:
     aliases = {
         "pro_1x": "pro", "max_5x": "max_5x", "max_20x": "max_20x",
         "ultra_5x": "ultra_5x", "ultra_20x": "ultra_20x",
+        "supergrok_heavy": "supergrok_heavy", "supergrok_lite": "supergrok_lite",
+        "supergrok": "supergrok", "x_basic": "x_basic", "x_premium": "x_premium",
+        "x_premium+": "x_premium_plus", "x_premium_plus": "x_premium_plus",
     }
     key = aliases.get(label, label)
     return float(CAPACITY_POINTS.get(service, {}).get(key, 100))
@@ -416,12 +747,12 @@ def print_table(results: list[dict[str, Any]]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Codex / Claude Code / agy の残り使用量を一覧表示")
+    parser = argparse.ArgumentParser(description="Codex / Claude Code / agy / Grok の残り使用量を一覧表示")
     parser.add_argument("--json", action="store_true", help="機械可読なJSONを出力")
-    parser.add_argument("--service", choices=("codex", "claude", "agy"), action="append", help="対象を限定（複数指定可）")
+    parser.add_argument("--service", choices=("codex", "claude", "agy", "grok"), action="append", help="対象を限定（複数指定可）")
     args = parser.parse_args()
-    selected = args.service or ["codex", "claude", "agy"]
-    checkers = {"codex": codex_usage, "claude": claude_usage, "agy": agy_usage}
+    selected = args.service or ["codex", "claude", "agy", "grok"]
+    checkers = {"codex": codex_usage, "claude": claude_usage, "agy": agy_usage, "grok": grok_usage}
     results = [checkers[name]() for name in selected]
     plans = load_local_config().get("plans", {})
     if isinstance(plans, dict):
