@@ -12,6 +12,8 @@ Claude / Codex / Gemini / Grok / Kimi の5サービスを調査し、現在の�
 | Grok | 未契約 | 契約不要。GitHub Copilot Free(無料)で試せる |
 | Kimi | 未契約 | 必須ではないが、Claude天井対策としてModerato($15プロモ)の試験導入に価値あり |
 
+※ 2026-07-26追記: 無料・極安の追加候補(DeepSeek / GLM / MiniMax と各種無料枠)は本ドキュメント後半の「追記: 無料・極安の選択肢」を参照。
+
 ---
 
 ## 5社比較(2026年7月時点)
@@ -73,10 +75,75 @@ Claude / Codex / Gemini / Grok / Kimi の5サービスを調査し、現在の�
 
 ---
 
+## 追記: 無料・極安の選択肢(2026-07-26調査)
+
+Claudeの週次上限オフロード先として、DeepSeekと中国系の格安コーディングプラン、無料枠を追加調査した。**結論: 追加コストゼロの枠(Antigravity CLI)を先に使い切り、次にDeepSeekの従量課金をClaude Codeへ挿す。定額の安心が欲しければGLM Coding Plan Lite。**
+
+### 追加コストゼロで使える枠
+
+| 手段 | 内容 | 備考 |
+|---|---|---|
+| **Antigravity CLI(`agy`)** | 契約中のGemini AI Pro($19.99)の枠内 | **すでに支払い済み。最優先のオフロード先** |
+| GitHub Copilot Free | 月2,000コード補完+50チャット、Autoにgrok-code-fast-1を含む | GitHubアカウントのみで可 |
+| Cerebras 無料枠 | GPT-OSS 120Bを1日14,400リクエスト | 高速。OpenCode / Clineから利用 |
+| OpenRouter `:free` モデル | Qwen系、gemini-2.0-flash-exp(1Mコンテキスト)など | `:free`は20種以上あるが実用は8モデル程度 |
+| DeepSeek 新規登録 | API 500万トークン無料 | 品質確認の試用に十分 |
+| Kimi Adagio | 無料ティア | K3はModerato以上でないと使えない |
+
+### DeepSeek — 従量課金での最安手
+
+- 定額サブスクは存在せず**純粋な従量課金**。月額固定費ゼロで使った分だけ。
+- **V4 Flash: $0.14/$0.28 per 1M tokens**(1Mコンテキスト) / **V4 Pro: $0.435/$0.87**(恒久75%値下げ後)。
+- **`api.deepseek.com/anthropic` のAnthropic互換エンドポイントが公式提供**されており、環境変数の設定だけでClaude Code本体をそのままDeepSeekで動かせる。CLIを覚え直す必要がない。
+
+```sh
+export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+export ANTHROPIC_AUTH_TOKEN=<YOUR_DEEPSEEK_API_KEY>
+export ANTHROPIC_API_KEY=<YOUR_DEEPSEEK_API_KEY>
+export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
+```
+
+- モデルIDはV4系で `deepseek-v4-pro[1m]` 等(`deepseek-chat` は旧ID)。V4 Proをmain/default、V4 FlashをHaiku相当・サブエージェントへ割り当てる構成が公式ドキュメントの推奨。
+- 注意: Anthropic公式サポートの構成ではない(DeepSeek側がドキュメント化し、Anthropicが黙認している状態)。
+
+### 定額の格安コーディングプラン
+
+| プラン | 最安ティア | 上限の目安 | Claude Code対応 |
+|---|---|---|---|
+| **GLM(Z.ai)** | **Lite $18/月**(年払い等の割引で**$12.60/月**) | 約80プロンプト/5時間、400/週 | ◎ Anthropic互換で公式サポート |
+| **MiniMax** | **Starter $10/月** / Plus $20 / Max $50 | Starter 約100プロンプト/5時間 | ◎(20以上のツールに対応) |
+| Kimi | Moderato $19($15プロモ) | K3は256Kコンテキストまで | ◎ |
+| Qwen | $50/月 | 約6,000リクエスト/5時間、9万/月 | ○ ただし割高 |
+
+- **GLMが価格対性能で最も評価が高い**。全ティアでGLM-5.2 / GLM-5-Turbo / GLM-4.7 / GLM-4.5-Airが使え、Claude Code・Cline・OpenCodeへのドロップインをZ.aiが公式に案内している。上位はPro $72 / Max $160。割引は月払い10%・四半期20%・年払い30%。
+- MiniMax Starter $10が名目最安。ただし**トークン枠がコーディング以外(画像・音声・動画)と共用**のため、マルチモーダル併用で想定より早く枯れる。
+- **Qwen Codeの無料OAuth枠は2026年4月15日で終了**(1,000→100リクエスト/日と段階的に削減後、廃止)。CLI自体はOSSのままなので、自前APIキー運用なら選択肢に残る。
+- 比較サイトごとにGLMの価格表記が$10/$30/$80と$18/$72/$160で割れている。**$18が現行の定価**で、前者は割引後またはプロモ時点の数字と見られる。契約前にz.aiの公式ページで要確認。
+
+### 推奨アクション(効果順)
+
+1. **Antigravity CLIを使い倒す** — 追加費用ゼロ。契約済みのAI Pro枠。
+2. **DeepSeekの従量課金をClaude Codeに挿す** — 軽いタスクを全部逃がしても月数ドル規模に収まる見込み。まず無料500万トークンで品質を確認。
+3. それでも定額の安心が欲しければ **GLM Coding Plan Lite(年払い$12.60/月)** — Kimi Moderato $19より安く、Claude Code互換性も同等以上。
+
+### 注意: データ送信先
+
+DeepSeek / Kimi / GLM / MiniMaxはいずれも中国系サービスで、**コードとプロンプトが国外サーバーへ送信される**。業務リポジトリで使う場合はデータ取扱いポリシーと社内規程の確認が必須。個人の検証用途なら問題ないが、業務利用はAntigravity CLI / Copilot Free側に寄せるほうが安全。
+
+---
+
 ## 主な情報源
 
 - Claude: [Claude Code Usage Limits (Morph)](https://www.morphllm.com/claude-code-usage-limits) / [週次上限プロモ延長 (Help Net Security)](https://www.helpnetsecurity.com/2026/07/13/claude-code-weekly-limits-promotion-extended/)
 - Codex: [Codex Pricing (Morph)](https://www.morphllm.com/codex-pricing) / [Codex Usage Limits解説](https://knightli.com/en/2026/04/15/codex-usage-limits-five-hour-weekly-credits/)
 - Gemini: [Antigravity CLI移行 (note)](https://note.com/sunwood_ai_labs/n/n135ffa38aef2) / [Antigravity CLIとは (AI総合研究所)](https://www.ai-souken.com/article/what-is-antigravity-cli) / [Antigravity 2.0 (BigGo)](https://finance.biggo.jp/news/202605211851_Google_Antigravity_2.0_Launch_New_AI_Ultra_Plan)
 - Grok: [grok-code-fast-1公式](https://x.ai/news/grok-code-fast-1) / [Copilot Free対応 (GitHub Changelog)](https://github.blog/changelog/2026-03-04-grok-code-fast-1-is-now-available-in-copilot-free-auto-model-selection/) / [xAI Dev Stack 2026 (Codersera)](https://codersera.com/blog/xai-grok-build-skills-connectors-guide-2026/)
-- Kimi: [Kimi K3料金(公式)](https://www.kimi.com/ja-jp/resources/kimi-k3-pricing) / [Kimi Code with K3 (Digital Applied)](https://www.digitalapplied.com/blog/kimi-code-k3-hands-on-setup-plans-cache-2026) / [料金ヘルプ(公式)](https://www.kimi.com/ja/help/membership/membership-pricing)
+- Kimi: [Kimi K3料金(公式)](https://www.kimi.com/ja-jp/resources/kimi-k3-pricing) / [Kimi Code with K3 (Digital Applied)](https://www.digitalapplied.com/blog/kimi-code-k3-hands-on-setup-plans-cache-2026) / [料金ヘルプ(公式)](https://www.kimi.com/ja/help/membership/membership-pricing) / [Kimi Code Plans and Pricing (CodeAgentSwarm)](https://www.codeagentswarm.com/en/guides/kimi-code-plans-and-pricing)
+
+追記調査(2026-07-26)分:
+
+- DeepSeek: [DeepSeek Pricing 2026 (FelloAI)](https://felloai.com/deepseek-pricing/) / [V4 Pro Pricing Guide (DeepInfra)](https://deepinfra.com/blog/deepseek-v4-pro-pricing-guide-2026-providers-cost-analysis) / [Claude Code公式ANTHROPIC_BASE_URL設定 (TheRouter)](https://therouter.ai/news/deepseek-awesome-agent-claude-code-copilot-opencode-routing/) / [How to Use DeepSeek V4 in Claude Code (Verdent)](https://www.verdent.ai/guides/deepseek-v4-in-claude-code)
+- GLM: [GLM Coding Plan Pricing (AI Pricing Guru)](https://www.aipricing.guru/z-ai-subscription-pricing/) / [$18 GLM Coding Plan 価値分析 (Digital Applied)](https://www.digitalapplied.com/blog/glm-coding-plan-worth-it-2026-value-analysis) / [Z.AI Pricing & Tiers (Layer3Labs)](https://www.layer3labs.io/guides/glm-coding-plan-explained)
+- MiniMax: [MiniMax Pricing 2026 (FelloAI)](https://felloai.com/minimax-pricing/) / [M2.5 Pricing (Verdent)](https://www.verdent.ai/guides/minimax-m2-5-pricing)
+- Qwen: [無料枠終了の経緯 (InventiveHQ)](https://inventivehq.com/blog/qwen-code-still-free-2026-shutdown) / [Qwen OAuth Free Tier Policy Adjustment (GitHub Issue #3203)](https://github.com/QwenLM/qwen-code/issues/3203)
+- 横断比較・無料枠: [AI Coding Plan Comparison 2026 (coding-plan.org)](https://coding-plan.org/en/) / [無料LLM API一覧@10社以上 (note)](https://note.com/gadget_hack/n/nd391c04bc338) / [OpenRouter無料モデル8選 (Qiita)](https://qiita.com/locallab/items/3dbfadf579a3a480c78a)
