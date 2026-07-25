@@ -1,6 +1,6 @@
 # AI Usage Check
 
-Codex、Claude Code、Antigravity CLI (`agy`) の残り使用量を1つの表にまとめるmacOS/Linux向けCLIです。認証トークンは標準出力にもファイルにも保存しません。
+Codex、Claude Code、Antigravity CLI (`agy`)、Grok Build (`grok`) の残り使用量を1つの表にまとめるmacOS/Linux向けCLIです。認証トークンは標準出力にもファイルにも保存しません。
 
 ## セットアップ
 
@@ -17,7 +17,13 @@ Antigravity IDEが起動中なら、補助CLIがローカル接続から使用�
 antigravity-usage login
 ```
 
-補助CLIがなくてもCodexとClaude Codeのチェックは動作します。
+Grokは Grok Build CLI (`@xai-official/grok`) のログイン情報（`~/.grok/auth.json`）をそのまま利用します。未ログインなら一度ログインしてください。
+
+```sh
+grok login
+```
+
+補助CLIやGrok CLIがなくてもCodexとClaude Codeのチェックは動作します。
 
 このディレクトリの外から `ai-usage` として使う場合:
 
@@ -32,6 +38,7 @@ ai-usage
 ./usage_check.py
 ./usage_check.py --json
 ./usage_check.py --service codex --service claude
+./usage_check.py --service grok
 ```
 
 ## 取得方法
@@ -39,8 +46,11 @@ ai-usage
 - Codex: `codex app-server` の公式 `account/rateLimits/read` API
 - Claude Code: Claude CodeのローカルOAuth認証を使う使用量API
 - agy: `antigravity-usage quota --json`（Antigravity IDEへのローカル接続、または補助CLI独自のOAuth認証）
+- Grok: Grok Build CLIのOAuth認証（`~/.grok/auth.json`）で課金APIと契約APIを参照。アクセストークンが期限切れならリフレッシュトークンで自動更新します（更新後のトークンはメモリ上のみで、ファイルへは書き戻しません）
 
 未ログインやCLI未導入のサービスはERROR行になり、取得できた他サービスはそのまま表示されます。Claude CodeをAPIキー課金で利用している場合、サブスクリプションの残量枠は返りません。
+
+Grokは課金APIが使用枠を返さないプラン（X Basicなどの無料枠）だと、プランだけ取得できて `取得済み（表示可能な枠なし）` になります。使用枠が表示されるのは、クレジット枠を持つSuperGrok系プランで Grok Build を利用している場合です。トークンは環境変数 `GROK_ACCESS_TOKEN`（または `XAI_ACCESS_TOKEN`）でも渡せます。
 
 Claude行が `APIエラー HTTP 429` になる場合は、使用量エンドポイントのレート枠（アカウント単位・スライディング型）に達しています。**触るほど解けにくくなる**ため、約1時間放置してから1回だけ再実行してください。詳細は [docs/claude-429-rate-limit.md](docs/claude-429-rate-limit.md)。
 
@@ -64,5 +74,5 @@ APIからプランを取得できない場合は、Git管理されない `.usage
 
 - `.env` とその派生ファイル
 - OAuthトークン、APIキー、秘密鍵
-- `~/.claude/`、`~/.codex/`、`~/.gemini/` 内のファイル
+- `~/.claude/`、`~/.codex/`、`~/.gemini/`、`~/.grok/` 内のファイル
 - `~/Library/Application Support/antigravity-usage/` 内のファイル

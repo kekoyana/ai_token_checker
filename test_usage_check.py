@@ -5,7 +5,20 @@ from datetime import datetime, timezone
 from io import StringIO
 from unittest.mock import patch
 
-from usage_check import agy_usage, capacity_text, estimated_left_text, flatten_agy, pace_text, print_table, reset_text
+from usage_check import (
+    GROK_SUBSCRIPTIONS_URL,
+    agy_usage,
+    capacity_text,
+    estimated_left_text,
+    flatten_agy,
+    grok_billing_windows,
+    grok_percent,
+    grok_plan_from_tier,
+    grok_usage,
+    pace_text,
+    print_table,
+    reset_text,
+)
 
 
 class FormattingTests(unittest.TestCase):
@@ -28,6 +41,8 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(capacity_text("agy", "AI Pro"), "AI Pro")
         self.assertEqual(capacity_text("codex", "plus"), "Plus")
         self.assertEqual(capacity_text("codex", None), "不明")
+        self.assertEqual(capacity_text("grok", "supergrok_heavy"), "SuperGrok Heavy")
+        self.assertEqual(capacity_text("grok", "x_basic"), "X Basic")
 
     def test_cross_service_estimated_ranking_is_printed(self):
         results = [
@@ -104,6 +119,73 @@ class AgyUsageTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["windows"]), 1)
+
+
+class GrokUsageTests(unittest.TestCase):
+    def test_percent_accepts_fraction_and_whole(self):
+        self.assertEqual(grok_percent({"val": 0.25}), 25.0)
+        self.assertEqual(grok_percent(42), 42.0)
+        self.assertIsNone(grok_percent(None))
+
+    def test_plan_tier_prefix_is_stripped(self):
+        self.assertEqual(grok_plan_from_tier("SUBSCRIPTION_TIER_SUPER_GROK_HEAVY"), "super_grok_heavy")
+        self.assertIsNone(grok_plan_from_tier(None))
+
+    def test_billing_windows_from_credits_and_on_demand(self):
+        credits = {
+            "creditUsagePercent": {"val": 0.25},
+            "currentPeriod": {
+                "type": "BILLING_PERIOD_TYPE_MONTHLY",
+                "start": "2026-07-01T00:00:00Z",
+                "end": "2026-08-01T00:00:00Z",
+            },
+            "onDemandCap": {"val": 100},
+            "onDemandUsed": {"val": 20},
+        }
+
+        windows = grok_billing_windows(credits, {})
+
+        self.assertEqual([w["name"] for w in windows], ["月間", "従量"])
+        self.assertEqual(windows[0]["remaining_percent"], 75.0)
+        self.assertEqual(windows[0]["window_minutes"], 44640)
+        self.assertEqual(windows[1]["remaining_percent"], 80.0)
+
+    def test_dollar_limits_are_used_when_credits_missing(self):
+        dollars = {
+            "monthlyLimit": {"val": 200},
+            "used": {"val": 50},
+            "billingPeriodEnd": "2026-08-01T00:00:00Z",
+        }
+
+        windows = grok_billing_windows({}, dollars)
+
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0]["name"], "月間")
+        self.assertEqual(windows[0]["remaining_percent"], 75.0)
+
+    @patch("usage_check.grok_access_token", return_value=("token", None))
+    def test_usage_reports_plan_from_subscriptions(self, _token):
+        def fake_request(url, _token_value, query=None):
+            if url == GROK_SUBSCRIPTIONS_URL:
+                return {"subscriptions": [{"status": "ACTIVE", "tier": "SUBSCRIPTION_TIER_SUPERGROK"}]}
+            if query:
+                return {"config": {"creditUsagePercent": {"val": 0.1}}}
+            return {}
+
+        with patch("usage_check.grok_request_json", side_effect=fake_request):
+            result = grok_usage()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["plan"], "supergrok")
+        self.assertEqual(result["windows"][0]["remaining_percent"], 90.0)
+
+    @patch("usage_check.grok_access_token", side_effect=RuntimeError("GrokのOAuth認証情報が見つかりません"))
+    def test_missing_credentials_are_reported(self, _token):
+        result = grok_usage()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["service"], "grok")
+        self.assertIn("GrokのOAuth認証情報が見つかりません", result["error"])
 
 
 if __name__ == "__main__":
