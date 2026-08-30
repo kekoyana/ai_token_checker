@@ -46,6 +46,7 @@ ai-usage
 - Codex: `codex app-server` の公式 `account/rateLimits/read` API
 - Claude Code: Claude CodeのローカルOAuth認証を使う使用量API
 - agy: `antigravity-usage quota --json`（Antigravity IDEへのローカル接続、または補助CLI独自のOAuth認証）
+  - Gemini系モデルはAPIが残量（`remainingPercentage`）を返さないため、REMAINは「不明」と表示します。リセット時刻は取得できるので、どの枠がいつ回復するかは確認できます。
 - Grok: Grok Build CLIのOAuth認証（`~/.grok/auth.json`）で課金APIと契約APIを参照。アクセストークンが期限切れならリフレッシュトークンで自動更新します（更新後のトークンはメモリ上のみで、ファイルへは書き戻しません）
 
 未ログインやCLI未導入のサービスはERROR行になり、取得できた他サービスはそのまま表示されます。Claude CodeをAPIキー課金で利用している場合、サブスクリプションの残量枠は返りません。

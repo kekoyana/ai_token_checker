@@ -184,18 +184,31 @@ def agy_usage() -> dict[str, Any]:
             raw = json.loads(completed.stdout)
             models = raw.get("models", []) if isinstance(raw, dict) else []
             windows = []
-            seen_windows: set[tuple[str, float, Any]] = set()
+            seen_windows: set[tuple[str, Any, Any]] = set()
             for model in models:
-                if not isinstance(model, dict) or model.get("remainingPercentage") is None:
+                if not isinstance(model, dict):
                     continue
-                remaining = float(model["remainingPercentage"]) * 100.0
-                name = model.get("label") or model.get("modelId") or model.get("id") or "model"
-                remaining = max(0.0, min(100.0, remaining))
+                raw_remaining = model.get("remainingPercentage")
                 reset = model.get("resetTime")
+                if raw_remaining is None and reset is None:
+                    continue
+                if model.get("isExhausted"):
+                    remaining = 0.0
+                elif raw_remaining is None:
+                    # Gemini系はremainingPercentageを返さない。枠の存在とリセット時刻だけ載せる。
+                    remaining = None
+                else:
+                    remaining = max(0.0, min(100.0, float(raw_remaining) * 100.0))
+                name = model.get("label") or model.get("modelId") or model.get("id") or "model"
                 identity = (str(name), remaining, reset)
                 if identity not in seen_windows:
                     seen_windows.add(identity)
-                    windows.append({"name": name, "remaining_percent": remaining, "resets_at": reset, "window_minutes": 300})
+                    windows.append({
+                        "name": name,
+                        "remaining_percent": remaining,
+                        "resets_at": reset,
+                        "window_minutes": 300 if remaining is not None else None,
+                    })
             if not windows:
                 raise RuntimeError("使用枠のJSONにモデル情報がありません")
             return {"service": "agy", "ok": True, "plan": raw.get("planType"), "windows": windows}
@@ -683,21 +696,33 @@ def parse_reset_datetime(value: Any) -> datetime | None:
 def pace_text(row: dict[str, Any], now: datetime | None = None) -> str:
     reset = parse_reset_datetime(row.get("resets_at"))
     duration = row.get("window_minutes")
-    if reset is None and float(row.get("remaining_percent", 0)) >= 99.9:
+    remaining = row.get("remaining_percent")
+    if remaining is None:
+        return "不明"
+    remaining = float(remaining)
+    if reset is None and remaining >= 99.9:
         return "満タン"
+    # 残量が少ない事実はペース推定より優先する。ペース推定はウィンドウ長に
+    # 依存するため、そこを誤ると残り数%の枠に安心ラベルが付いてしまう。
+    if remaining <= 10.0:
+        return "枯渇寸前"
+    if remaining <= 25.0:
+        return "残りわずか"
     if reset is None or not duration:
         return "不明"
     now = now or datetime.now().astimezone()
     total = timedelta(minutes=float(duration))
     time_left = reset - now
-    elapsed_fraction = 1.0 - time_left / total
-    used = 100.0 - float(row["remaining_percent"])
     if time_left.total_seconds() <= 0:
         return "更新待ち"
+    if time_left > total * 2:
+        # 想定ウィンドウ長を大きく超えるリセット = window_minutesが実態と合っていない
+        # （取得タイミングによる誤差は許容するため2倍で判定）
+        return "不明"
+    elapsed_fraction = 1.0 - time_left / total
+    used = 100.0 - remaining
     if used <= 0.1:
         return "余裕あり"
-    if elapsed_fraction <= 0.05:
-        return "計測初期"
     projected_used = used / max(0.01, elapsed_fraction)
     if projected_used <= 70:
         return "余裕あり"
@@ -734,11 +759,16 @@ def print_table(results: list[dict[str, Any]]) -> None:
         if not rows:
             print(f"{result['service']:<9} {'取得済み（表示可能な枠なし）':<28}")
         for row in rows:
-            remaining = row["remaining_percent"]
-            used = 100.0 - remaining
-            estimate, points = estimated_left_text(result["service"], result.get("plan"), remaining, str(row["name"]))
-            service_scores.setdefault(result["service"], []).append(points)
-            print(f"{result['service']:<9} {str(row['name']):<28.28} {plan:<14.14} {used:>6.1f}% {remaining:>7.1f}%  {reset_text(row.get('resets_at')):<12} {pace_text(row):<12} {estimate}")
+            remaining = row.get("remaining_percent")
+            if remaining is None:
+                # 残量を返さない枠（Antigravity の Gemini 系）。枠の存在とリセット時刻は表示する。
+                used_text, remaining_text, estimate = "-", "不明", "残量API未提供"
+            else:
+                used_text = f"{100.0 - remaining:.1f}%"
+                remaining_text = f"{remaining:.1f}%"
+                estimate, points = estimated_left_text(result["service"], result.get("plan"), remaining, str(row["name"]))
+                service_scores.setdefault(result["service"], []).append(points)
+            print(f"{result['service']:<9} {str(row['name']):<28.28} {plan:<14.14} {used_text:>7} {remaining_text:>8}  {reset_text(row.get('resets_at')):<12} {pace_text(row):<12} {estimate}")
     scores = {service: sum(values) / len(values) for service, values in service_scores.items() if values}
     if len(scores) > 1:
         ranking = " > ".join(f"{service} ({score:.0f}pt)" for service, score in sorted(scores.items(), key=lambda item: item[1], reverse=True))

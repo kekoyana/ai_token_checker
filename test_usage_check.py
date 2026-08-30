@@ -120,6 +120,108 @@ class AgyUsageTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["windows"]), 1)
 
+    @patch("usage_check.subprocess.run")
+    @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
+    def test_models_without_remaining_percentage_are_kept(self, _which, run):
+        """Gemini系はremainingPercentageを返さない。枠ごと消えると枯渇に気付けない。"""
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps({
+            "models": [
+                {"label": "Claude Opus 4.6", "remainingPercentage": 1, "resetTime": "2026-08-30T18:28:41Z"},
+                {"label": "Gemini 3.1 Pro (High)", "resetTime": "2026-09-02T03:40:23Z"},
+            ]
+        })
+        run.return_value.stderr = ""
+
+        result = agy_usage()
+
+        self.assertTrue(result["ok"])
+        names = [w["name"] for w in result["windows"]]
+        self.assertIn("Gemini 3.1 Pro (High)", names)
+        gemini = next(w for w in result["windows"] if w["name"] == "Gemini 3.1 Pro (High)")
+        self.assertIsNone(gemini["remaining_percent"])
+        self.assertEqual(gemini["resets_at"], "2026-09-02T03:40:23Z")
+        # 5hウィンドウ前提のペース計算を62hの枠に適用しない
+        self.assertIsNone(gemini["window_minutes"])
+
+    @patch("usage_check.subprocess.run")
+    @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
+    def test_exhausted_model_is_zero_percent(self, _which, run):
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps({
+            "models": [{"label": "Gemini 3.7 Flash", "isExhausted": True, "resetTime": "2026-09-02T03:40:23Z"}]
+        })
+        run.return_value.stderr = ""
+
+        result = agy_usage()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["windows"][0]["remaining_percent"], 0.0)
+
+    @patch("usage_check.subprocess.run")
+    @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
+    def test_model_without_quota_or_reset_is_skipped(self, _which, run):
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps({
+            "models": [
+                {"label": "Useless"},
+                {"label": "Gemini 3 Flash", "resetTime": "2026-09-02T03:40:23Z"},
+            ]
+        })
+        run.return_value.stderr = ""
+
+        result = agy_usage()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([w["name"] for w in result["windows"]], ["Gemini 3 Flash"])
+
+    def test_print_table_renders_unknown_remaining(self):
+        """None行でTypeErrorを出さず、リセット時刻を見せる。"""
+        results = [{
+            "service": "agy",
+            "ok": True,
+            "plan": "AI Pro",
+            "windows": [
+                {"name": "Gemini 3.1 Pro (High)", "remaining_percent": None,
+                 "resets_at": "2026-09-02T03:40:23Z", "window_minutes": None},
+            ],
+        }]
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            print_table(results)
+        output = buffer.getvalue()
+        self.assertIn("Gemini 3.1 Pro (High)", output)
+        self.assertIn("不明", output)
+        self.assertNotIn("100.0%", output)
+
+    def test_pace_text_unknown_when_remaining_is_none(self):
+        row = {"name": "Gemini", "remaining_percent": None,
+               "resets_at": "2026-09-02T03:40:23Z", "window_minutes": None}
+        self.assertEqual(pace_text(row), "不明")
+
+    def test_low_remaining_is_not_labelled_as_early_measurement(self):
+        """残り6.2%の枠がペース推定で安心ラベル扱いされないこと。"""
+        now = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)  # JST 21:00
+        row = {"name": "gemini-3.7-flash-tiered", "remaining_percent": 6.2,
+               "resets_at": "2026-09-02T03:40:23Z", "window_minutes": 300}
+        self.assertEqual(pace_text(row, now), "枯渇寸前")
+
+    def test_remaining_under_quarter_is_flagged(self):
+        now = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
+        row = {"remaining_percent": 22.0, "resets_at": "2026-09-02T03:40:23Z", "window_minutes": 300}
+        self.assertEqual(pace_text(row, now), "残りわずか")
+
+    def test_window_minutes_inconsistent_with_reset_is_unknown(self):
+        """5hウィンドウ想定で62h先のリセットはペース推定に使えない。"""
+        now = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
+        row = {"remaining_percent": 80.0, "resets_at": "2026-09-02T03:40:23Z", "window_minutes": 300}
+        self.assertEqual(pace_text(row, now), "不明")
+
+    def test_normal_five_hour_window_still_evaluated(self):
+        now = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
+        row = {"remaining_percent": 100.0, "resets_at": "2026-08-30T16:00:00Z", "window_minutes": 300}
+        self.assertEqual(pace_text(row, now), "余裕あり")
+
 
 class GrokUsageTests(unittest.TestCase):
     def test_percent_accepts_fraction_and_whole(self):
