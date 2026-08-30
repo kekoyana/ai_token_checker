@@ -53,6 +53,8 @@ ai-usage
 
 Grokは課金APIが使用枠を返さないプラン（X Basicなどの無料枠）だと、プランだけ取得できて `取得済み（表示可能な枠なし）` になります。使用枠が表示されるのは、クレジット枠を持つSuperGrok系プランで Grok Build を利用している場合です。トークンは環境変数 `GROK_ACCESS_TOKEN`（または `XAI_ACCESS_TOKEN`）でも渡せます。
 
+agyが `Individual quota reached` で止まる場合、`Resets in ...` の残り時間は**残量ではありません**。枯渇して初めて実際の期限が表示されるため、「62時間ある」は「62時間使えない」という意味です。Gemini系は約3日、Claude系は5時間と枠ごとに周期が異なります。詳細は [docs/antigravity-quota-behavior.md](docs/antigravity-quota-behavior.md)。
+
 Claude行が `APIエラー HTTP 429` になる場合は、使用量エンドポイントのレート枠（アカウント単位・スライディング型）に達しています。**触るほど解けにくくなる**ため、約1時間放置してから1回だけ再実行してください。詳細は [docs/claude-429-rate-limit.md](docs/claude-429-rate-limit.md)。
 
 `USED` と `REMAIN` はAPIから取得した実際の割合です。`PACE` はウィンドウの経過時間と使用率から、現在のペースでリセットまで持つかを推定します。Claudeの `EST. LEFT` はAnthropic公表のプラン別目安から、5時間枠を推定プロンプト数の中央値、週間枠をSonnet 1時間＝2pt・Opus 1時間＝10ptとして共通ポイントへ換算します。他サービスのポイントと概算順位も仮の容量配点による参考値で、実際のタスク内容によって大きく外れる可能性があります。
