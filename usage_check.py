@@ -203,6 +203,40 @@ def claude_usage() -> dict[str, Any]:
         return error("claude", str(exc))
 
 
+def agy_infer_window_minutes(time_until_reset_ms: Any, remaining: float | None) -> int | None:
+    """timeUntilResetMs（残りミリ秒）と remainingPercentage からウィンドウ全体の期間を推定する。
+
+    残量割合と残り時間を組み合わせてウィンドウ全体長を推定し、区分に当てはめる:
+    - 全体長 ≤ 6h   → 5時間ウィンドウ (300 min)
+    - 全体長 ≤ 8日  → 週次 (10080 min)
+    - それ以上       → 月次 (43200 min)
+    """
+    if time_until_reset_ms is None:
+        return None
+    try:
+        remaining_ms = float(time_until_reset_ms)
+    except (TypeError, ValueError):
+        return None
+    if remaining_ms <= 0:
+        return None
+
+    # remaining_percent が分かる場合は全体ウィンドウ長を推定する
+    if remaining is not None and 0.0 < remaining < 100.0:
+        # 残り時間 / 残量割合 = 全体期間
+        total_ms = remaining_ms / (remaining / 100.0)
+    else:
+        # 残量不明 or 満タンの場合は残り時間を全体長の下限として扱う
+        total_ms = remaining_ms
+
+    total_minutes = total_ms / 60000.0
+
+    if total_minutes <= 360:    # ～6時間
+        return 300              # 5時間ウィンドウ
+    if total_minutes <= 11520:  # ～8日
+        return 10080            # 週次（7日）
+    return 43200                # 月次（30日）
+
+
 def agy_usage() -> dict[str, Any]:
     modern_command = shutil.which("antigravity-usage")
     if modern_command:
@@ -221,6 +255,7 @@ def agy_usage() -> dict[str, Any]:
                     continue
                 raw_remaining = model.get("remainingPercentage")
                 reset = model.get("resetTime")
+                time_until_reset_ms = model.get("timeUntilResetMs")
                 if raw_remaining is None and reset is None:
                     continue
                 if model.get("isExhausted"):
@@ -234,11 +269,12 @@ def agy_usage() -> dict[str, Any]:
                 identity = (str(name), remaining, reset)
                 if identity not in seen_windows:
                     seen_windows.add(identity)
+                    window_minutes = agy_infer_window_minutes(time_until_reset_ms, remaining)
                     windows.append({
                         "name": name,
                         "remaining_percent": remaining,
                         "resets_at": reset,
-                        "window_minutes": 300 if remaining is not None else None,
+                        "window_minutes": window_minutes,
                     })
             if not windows:
                 raise RuntimeError("使用枠のJSONにモデル情報がありません")
