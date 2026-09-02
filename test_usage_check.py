@@ -9,6 +9,7 @@ from usage_check import (
     GROK_SUBSCRIPTIONS_URL,
     agy_usage,
     capacity_text,
+    claude_windows,
     estimated_left_text,
     flatten_agy,
     grok_billing_windows,
@@ -54,6 +55,45 @@ class FormattingTests(unittest.TestCase):
             print_table(results)
         self.assertIn("概算残量順位: claude (415pt) > codex (92pt)", output.getvalue())
         self.assertIn("8.0%", output.getvalue())
+
+    def test_claude_windows_include_model_scoped_limits(self):
+        raw = {
+            "five_hour": {"utilization": 16.0, "resets_at": "2026-09-02T06:29:59+00:00"},
+            "seven_day": {"utilization": 2.0, "resets_at": "2026-09-07T13:59:59+00:00"},
+            "seven_day_opus": None,
+            "seven_day_sonnet": None,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 16, "resets_at": "2026-09-02T06:29:59+00:00", "scope": None},
+                {"kind": "weekly_all", "group": "weekly", "percent": 2, "resets_at": "2026-09-07T13:59:59+00:00", "scope": None},
+                {
+                    "kind": "weekly_scoped", "group": "weekly", "percent": 3,
+                    "resets_at": "2026-09-07T13:59:59+00:00",
+                    "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                },
+            ],
+        }
+        windows = claude_windows(raw)
+        self.assertEqual([window["name"] for window in windows], ["5時間", "7日", "7日 Fable"])
+        fable = windows[-1]
+        self.assertEqual(fable["used_percent"], 3.0)
+        self.assertEqual(fable["remaining_percent"], 97.0)
+        self.assertEqual(fable["window_minutes"], 10080)
+        self.assertEqual(fable["resets_at"], "2026-09-07T13:59:59+00:00")
+
+    def test_claude_windows_skip_duplicate_scoped_limits(self):
+        raw = {
+            "seven_day_opus": {"utilization": 40.0, "resets_at": None},
+            "limits": [
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 40, "scope": {"model": {"display_name": "Opus"}}},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": None, "scope": {"model": {"display_name": "Fable"}}},
+            ],
+        }
+        self.assertEqual([window["name"] for window in claude_windows(raw)], ["7日 Opus"])
+
+    def test_scoped_fable_window_falls_back_to_generic_points(self):
+        self.assertEqual(estimated_left_text("claude", "max_5x", 97.0, "7日 Fable"), ("約485pt (非常に多)", 485.0))
+        self.assertEqual(estimated_left_text("claude", "max_5x", 100.0, "7日 Opus"), ("約250pt (多)", 250.0))
+        self.assertEqual(estimated_left_text("claude", "max_5x", 100.0, "7日 Sonnet"), ("約420pt (非常に多)", 420.0))
 
     def test_estimated_left_uses_rough_plan_points(self):
         self.assertEqual(estimated_left_text("claude", "max_5x", 100.0, "5時間"), ("約125pt (中)", 125.0))

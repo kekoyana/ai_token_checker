@@ -45,6 +45,7 @@ ai-usage
 
 - Codex: `codex app-server` の公式 `account/rateLimits/read` API
 - Claude Code: Claude CodeのローカルOAuth認証を使う使用量API
+  - 5時間枠・7日枠に加え、応答の `limits` 配列にあるモデル別の週間枠（`7日 Fable` など）も1行ずつ表示します。Fable 5.1のような上位モデルは全体の7日枠とは別に専用の週間枠を持つため、この行で残量とリセット時刻を確認できます。
 - agy: `antigravity-usage quota --json`（Antigravity IDEへのローカル接続、または補助CLI独自のOAuth認証）
   - Gemini系モデルはAPIが残量（`remainingPercentage`）を返さないため、REMAINは「不明」と表示します。リセット時刻は取得できるので、どの枠がいつ回復するかは確認できます。
 - Grok: Grok Build CLIのOAuth認証（`~/.grok/auth.json`）で課金APIと契約APIを参照。アクセストークンが期限切れならリフレッシュトークンで自動更新します（更新後のトークンはメモリ上のみで、ファイルへは書き戻しません）
@@ -57,7 +58,7 @@ agyが `Individual quota reached` で止まる場合、`Resets in ...` の残り
 
 Claude行が `APIエラー HTTP 429` になる場合は、使用量エンドポイントのレート枠（アカウント単位・スライディング型）に達しています。**触るほど解けにくくなる**ため、約1時間放置してから1回だけ再実行してください。詳細は [docs/claude-429-rate-limit.md](docs/claude-429-rate-limit.md)。
 
-`USED` と `REMAIN` はAPIから取得した実際の割合です。`PACE` はウィンドウの経過時間と使用率から、現在のペースでリセットまで持つかを推定します。Claudeの `EST. LEFT` はAnthropic公表のプラン別目安から、5時間枠を推定プロンプト数の中央値、週間枠をSonnet 1時間＝2pt・Opus 1時間＝10ptとして共通ポイントへ換算します。他サービスのポイントと概算順位も仮の容量配点による参考値で、実際のタスク内容によって大きく外れる可能性があります。
+`USED` と `REMAIN` はAPIから取得した実際の割合です。`PACE` はウィンドウの経過時間と使用率から、現在のペースでリセットまで持つかを推定します。Claudeの `EST. LEFT` はAnthropic公表のプラン別目安から、5時間枠を推定プロンプト数の中央値、週間枠をSonnet 1時間＝2pt・Opus 1時間＝10ptとして共通ポイントへ換算します。公表目安のないモデル別枠（`7日 Fable` など）はプラン容量からの汎用換算になるため、他のClaude行より粗い参考値です。他サービスのポイントと概算順位も仮の容量配点による参考値で、実際のタスク内容によって大きく外れる可能性があります。
 
 APIからプランを取得できない場合は、Git管理されない `.usage_check.local.json` で指定できます。
 
