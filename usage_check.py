@@ -142,6 +142,45 @@ def claude_credentials() -> dict[str, Any]:
     raise RuntimeError("Claude CodeのOAuth認証情報が見つかりません（claude auth loginを実行してください）")
 
 
+def claude_windows(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build usage windows from the legacy top-level keys plus the newer `limits` array.
+
+    The `limits` array carries model-scoped weekly windows (e.g. Fable) that have no
+    dedicated top-level key, so they are only visible through this path.
+    """
+    windows: list[dict[str, Any]] = []
+    labels = {"five_hour": "5時間", "seven_day": "7日", "seven_day_sonnet": "7日 Sonnet", "seven_day_opus": "7日 Opus"}
+    for key, label in labels.items():
+        item = raw.get(key)
+        if not item:
+            continue
+        used = float(item.get("utilization", 0))
+        duration = 300 if key == "five_hour" else 10080 if key.startswith("seven_day") else None
+        windows.append({"name": label, "remaining_percent": max(0.0, 100.0 - used), "used_percent": used, "resets_at": item.get("resets_at"), "window_minutes": duration})
+    seen = {window["name"] for window in windows}
+    for limit in raw.get("limits") or []:
+        if not isinstance(limit, dict) or limit.get("kind") in ("session", "weekly_all") or limit.get("percent") is None:
+            continue
+        scope = limit.get("scope") or {}
+        model = scope.get("model") or {}
+        surface = scope.get("surface")
+        if isinstance(surface, dict):
+            surface = surface.get("display_name") or surface.get("id")
+        target = model.get("display_name") or model.get("id") or surface
+        if not target:
+            continue
+        group = limit.get("group")
+        prefix = "7日" if group == "weekly" else "5時間" if group == "session" else str(group or limit.get("kind"))
+        name = f"{prefix} {target}"
+        if name in seen:
+            continue
+        seen.add(name)
+        used = float(limit["percent"])
+        duration = 10080 if group == "weekly" else 300 if group == "session" else None
+        windows.append({"name": name, "remaining_percent": max(0.0, 100.0 - used), "used_percent": used, "resets_at": limit.get("resets_at"), "window_minutes": duration})
+    return windows
+
+
 def claude_usage() -> dict[str, Any]:
     try:
         credentials = claude_credentials()
@@ -154,15 +193,7 @@ def claude_usage() -> dict[str, Any]:
         )
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             raw = json.load(response)
-        windows = []
-        labels = {"five_hour": "5時間", "seven_day": "7日", "seven_day_sonnet": "7日 Sonnet", "seven_day_opus": "7日 Opus"}
-        for key, label in labels.items():
-            item = raw.get(key)
-            if not item:
-                continue
-            used = float(item.get("utilization", 0))
-            duration = 300 if key == "five_hour" else 10080 if key.startswith("seven_day") else None
-            windows.append({"name": label, "remaining_percent": max(0.0, 100.0 - used), "used_percent": used, "resets_at": item.get("resets_at"), "window_minutes": duration})
+        windows = claude_windows(raw)
         plan_parts = [credentials.get("subscriptionType"), credentials.get("rateLimitTier")]
         plan = " ".join(str(part) for part in plan_parts if part)
         return {"service": "claude", "ok": True, "plan": plan, "windows": windows}
@@ -652,14 +683,15 @@ def claude_window_points(plan: Any, limit_name: str, remaining_percent: float) -
 
     if limit_name == "5時間" and label in five_hour:
         return midpoint(five_hour[label]) * fraction
-    if limit_name.startswith("7日"):
+    if limit_name in ("7日", "7日 Sonnet", "7日 Opus"):
         points = 0.0
-        if "Opus" not in limit_name and label in weekly_sonnet:
+        if limit_name != "7日 Opus" and label in weekly_sonnet:
             points += midpoint(weekly_sonnet[label]) * 2.0
-        if "Sonnet" not in limit_name and label in weekly_opus:
+        if limit_name != "7日 Sonnet" and label in weekly_opus:
             points += midpoint(weekly_opus[label]) * 10.0
         if points:
             return points * fraction
+    # Model-scoped windows without published guidance (e.g. "7日 Fable") fall back to generic points.
     return None
 
 
