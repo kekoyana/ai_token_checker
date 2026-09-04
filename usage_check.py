@@ -237,6 +237,59 @@ def agy_infer_window_minutes(time_until_reset_ms: Any, remaining: float | None) 
     return 43200                # 月次（30日）
 
 
+def is_gemini_entry(item: dict[str, Any] | str) -> bool:
+    """判定対象の名前や識別子に gemini が含まれるか判定する。"""
+    if isinstance(item, str):
+        return "gemini" in item.lower()
+    if isinstance(item, dict):
+        text = " ".join(
+            str(item.get(k) or "")
+            for k in ("name", "label", "modelId", "id")
+        ).lower()
+        return "gemini" in text
+    return False
+
+
+def consolidate_gemini_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Gemini系モデルはすべて同一のクォータ枠を共有するため、1つの共通枠に集約する。"""
+    gemini_rows = [r for r in rows if is_gemini_entry(r)]
+    if not gemini_rows:
+        return rows
+
+    any_zero = any(r.get("remaining_percent") == 0.0 for r in gemini_rows)
+    valid_pcts = [r["remaining_percent"] for r in gemini_rows if r.get("remaining_percent") is not None]
+    if any_zero:
+        remaining: float | None = 0.0
+    elif valid_pcts:
+        remaining = min(valid_pcts)
+    else:
+        remaining = None
+
+    valid_resets = [r.get("resets_at") for r in gemini_rows if r.get("resets_at")]
+    reset = min(valid_resets) if valid_resets else None
+
+    valid_windows = [r.get("window_minutes") for r in gemini_rows if r.get("window_minutes") is not None]
+    window_minutes = min(valid_windows) if valid_windows else None
+
+    consolidated = {
+        "name": "Gemini (共通枠)",
+        "remaining_percent": remaining,
+        "resets_at": reset,
+        "window_minutes": window_minutes,
+    }
+
+    new_rows: list[dict[str, Any]] = []
+    gemini_added = False
+    for r in rows:
+        if is_gemini_entry(r):
+            if not gemini_added:
+                new_rows.append(consolidated)
+                gemini_added = True
+        else:
+            new_rows.append(r)
+    return new_rows
+
+
 def agy_usage() -> dict[str, Any]:
     modern_command = shutil.which("antigravity-usage")
     if modern_command:
@@ -261,7 +314,7 @@ def agy_usage() -> dict[str, Any]:
                 if model.get("isExhausted"):
                     remaining = 0.0
                 elif raw_remaining is None:
-                    # Gemini系はremainingPercentageを返さない。枠の存在とリセット時刻だけ載せる。
+                    # Gemini系はremainingPercentageを返さない場合がある。枠の存在とリセット時刻だけ載せる。
                     remaining = None
                 else:
                     remaining = max(0.0, min(100.0, float(raw_remaining) * 100.0))
@@ -278,6 +331,7 @@ def agy_usage() -> dict[str, Any]:
                     })
             if not windows:
                 raise RuntimeError("使用枠のJSONにモデル情報がありません")
+            windows = consolidate_gemini_rows(windows)
             return {"service": "agy", "ok": True, "plan": raw.get("planType"), "windows": windows}
         except Exception as exc:
             return error("agy", str(exc))
@@ -824,6 +878,7 @@ def print_table(results: list[dict[str, Any]]) -> None:
         rows = result.get("windows", [])
         if result["service"] == "agy" and "data" in result:
             rows = [{"name": n, "remaining_percent": p, "resets_at": r} for n, p, r in flatten_agy(result["data"])]
+            rows = consolidate_gemini_rows(rows)
         if not rows:
             print(f"{result['service']:<9} {'取得済み（表示可能な枠なし）':<28}")
         for row in rows:

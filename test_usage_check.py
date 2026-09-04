@@ -141,7 +141,7 @@ class AgyUsageTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["windows"][0]["remaining_percent"], 62.5)
-        self.assertEqual(result["windows"][0]["name"], "Gemini 3.5 Flash")
+        self.assertEqual(result["windows"][0]["name"], "Gemini (共通枠)")
 
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
@@ -163,7 +163,7 @@ class AgyUsageTests(unittest.TestCase):
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
     def test_models_without_remaining_percentage_are_kept(self, _which, run):
-        """Gemini系はremainingPercentageを返さない。枠ごと消えると枯渇に気付けない。"""
+        """Gemini系はremainingPercentageを返さない場合がある。枠ごと消えると枯渇に気付けない。"""
         run.return_value.returncode = 0
         run.return_value.stdout = json.dumps({
             "models": [
@@ -177,8 +177,8 @@ class AgyUsageTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         names = [w["name"] for w in result["windows"]]
-        self.assertIn("Gemini 3.1 Pro (High)", names)
-        gemini = next(w for w in result["windows"] if w["name"] == "Gemini 3.1 Pro (High)")
+        self.assertIn("Gemini (共通枠)", names)
+        gemini = next(w for w in result["windows"] if w["name"] == "Gemini (共通枠)")
         self.assertIsNone(gemini["remaining_percent"])
         self.assertEqual(gemini["resets_at"], "2026-09-02T03:40:23Z")
         # 5hウィンドウ前提のペース計算を62hの枠に適用しない
@@ -213,7 +213,33 @@ class AgyUsageTests(unittest.TestCase):
         result = agy_usage()
 
         self.assertTrue(result["ok"])
-        self.assertEqual([w["name"] for w in result["windows"]], ["Gemini 3 Flash"])
+        self.assertEqual([w["name"] for w in result["windows"]], ["Gemini (共通枠)"])
+
+    @patch("usage_check.subprocess.run")
+    @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
+    def test_multiple_gemini_models_are_consolidated(self, _which, run):
+        run.return_value.returncode = 0
+        run.return_value.stdout = json.dumps({
+            "models": [
+                {"label": "Claude Opus 4.6 (Thinking)", "remainingPercentage": 1.0, "resetTime": "2026-09-03T06:42:38Z"},
+                {"label": "Gemini 2.5 Pro", "modelId": "gemini-2.5-pro", "remainingPercentage": 0.95, "resetTime": "2026-09-03T06:41:42Z"},
+                {"label": "Gemini 3 Flash", "modelId": "gemini-3-flash", "remainingPercentage": 0.95, "resetTime": "2026-09-03T06:41:42Z"},
+                {"label": "Gemini 3.8 Flash (Medium)", "modelId": "gemini-3.8-flash-medium", "remainingPercentage": 0.95, "resetTime": "2026-09-03T06:41:42Z"},
+                {"label": "GPT-OSS 120B (Medium)", "modelId": "gpt-oss-120b-medium", "remainingPercentage": 1.0, "resetTime": "2026-09-03T06:42:38Z"},
+            ]
+        })
+        run.return_value.stderr = ""
+
+        result = agy_usage()
+
+        self.assertTrue(result["ok"])
+        windows = result["windows"]
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(windows[0]["name"], "Claude Opus 4.6 (Thinking)")
+        self.assertEqual(windows[1]["name"], "Gemini (共通枠)")
+        self.assertEqual(windows[1]["remaining_percent"], 95.0)
+        self.assertEqual(windows[1]["resets_at"], "2026-09-03T06:41:42Z")
+        self.assertEqual(windows[2]["name"], "GPT-OSS 120B (Medium)")
 
     def test_print_table_renders_unknown_remaining(self):
         """None行でTypeErrorを出さず、リセット時刻を見せる。"""
