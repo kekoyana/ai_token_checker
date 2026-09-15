@@ -1,13 +1,18 @@
 import json
+import re
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from unittest.mock import patch
 
 from usage_check import (
+    ANSI_RESET,
     GROK_SUBSCRIPTIONS_URL,
     agy_usage,
+    display_width,
+    pace_severity,
+    percent_severity,
     capacity_text,
     claude_windows,
     estimated_left_text,
@@ -354,6 +359,99 @@ class GrokUsageTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["service"], "grok")
         self.assertIn("GrokのOAuth認証情報が見つかりません", result["error"])
+
+
+class TableRenderingTests(unittest.TestCase):
+    def test_full_width_characters_count_as_two_columns(self):
+        self.assertEqual(display_width("5時間"), 5)
+        self.assertEqual(display_width("Max 5x"), 6)
+
+    def test_rows_with_japanese_stay_aligned(self):
+        results = [{
+            "service": "claude",
+            "ok": True,
+            "plan": "max_5x",
+            "windows": [
+                {"name": "5時間", "remaining_percent": 64.0, "window_minutes": 300},
+                {"name": "7日 Fable", "remaining_percent": 96.0, "window_minutes": 10080},
+            ],
+        }]
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            print_table(results)
+        lines = [line for line in buffer.getvalue().splitlines() if line.startswith(("┌", "│", "├", "└"))]
+        widths = {display_width(line) for line in lines}
+        self.assertEqual(len(widths), 1, f"罫線幅が揃っていない: {sorted(widths)}")
+
+    def test_long_error_is_clipped_in_table_and_shown_in_full_below(self):
+        message = "GrokのOAuth認証情報が見つかりません（grok loginを実行してください）"
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            print_table([{"service": "grok", "ok": False, "error": message}])
+        output = buffer.getvalue()
+        self.assertIn("…", output)
+        self.assertIn(f"grok: {message}", output)
+        table_lines = [line for line in output.splitlines() if line.startswith("│")]
+        self.assertTrue(all(display_width(line) < 100 for line in table_lines))
+
+
+class ColorTests(unittest.TestCase):
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+
+    def render(self, windows, use_color=True, service="agy", plan="AI Pro"):
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            print_table([{"service": service, "ok": True, "plan": plan, "windows": windows}], use_color=use_color)
+        return buffer.getvalue()
+
+    def test_severity_thresholds(self):
+        self.assertEqual(percent_severity(8.3), "red")
+        self.assertEqual(percent_severity(10.0), "red")
+        self.assertEqual(percent_severity(12.8), "yellow")
+        self.assertEqual(percent_severity(25.0), "yellow")
+        self.assertIsNone(percent_severity(25.1))
+        self.assertIsNone(percent_severity(None))
+
+    def test_pace_severity_is_independent_of_remaining(self):
+        self.assertEqual(pace_severity("枯渇寸前"), "red")
+        self.assertEqual(pace_severity("枯渇懸念"), "yellow")
+        self.assertIsNone(pace_severity("余裕あり"))
+
+    def test_low_remaining_is_red_and_warning_is_yellow(self):
+        output = self.render([
+            {"name": "Gemini (共通枠)", "remaining_percent": 8.3, "window_minutes": None},
+            {"name": "Claude Opus 4.6", "remaining_percent": 12.8, "window_minutes": None},
+        ])
+        self.assertIn(f"{self.RED}  8.3%{ANSI_RESET}", output)
+        self.assertIn(f"{self.YELLOW} 12.8%{ANSI_RESET}", output)
+
+    def test_ample_remaining_is_not_colored(self):
+        output = self.render([{"name": "7日", "remaining_percent": 94.0, "window_minutes": None}])
+        self.assertNotIn("\033[", output)
+
+    def test_pace_warning_does_not_colour_remaining(self):
+        """残量83%の行はREMAINを塗らず、速い消費ペースだけをPACE列で警告する。"""
+        reset = (datetime.now().astimezone() + timedelta(days=6)).isoformat()
+        output = self.render(
+            [{"name": "7日", "remaining_percent": 83.0, "window_minutes": 10080, "resets_at": reset}],
+            service="claude", plan="max_5x",
+        )
+        self.assertNotIn(f"{self.YELLOW} 83.0%", output)
+        self.assertRegex(output, r"\033\[93m(やや速い|枯渇懸念)")
+
+    def test_colors_are_off_when_disabled(self):
+        output = self.render([{"name": "Gemini (共通枠)", "remaining_percent": 8.3}], use_color=False)
+        self.assertNotIn("\033[", output)
+
+    def test_colored_rows_stay_aligned(self):
+        output = self.render([
+            {"name": "Gemini (共通枠)", "remaining_percent": 8.3, "window_minutes": None},
+            {"name": "Claude Opus 4.6 (Thinking)", "remaining_percent": 88.0, "window_minutes": None},
+        ])
+        plain = re.sub(r"\033\[[0-9;]*m", "", output)
+        lines = [line for line in plain.splitlines() if line.startswith(("┌", "│", "├", "└"))]
+        self.assertEqual(len({display_width(line) for line in lines}), 1)
 
 
 if __name__ == "__main__":
