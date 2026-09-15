@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -866,22 +867,120 @@ def load_local_config() -> dict[str, Any]:
         return {}
 
 
-def print_table(results: list[dict[str, Any]]) -> None:
-    print(f"{'SERVICE':<9} {'LIMIT':<28} {'PLAN':<14} {'USED':>7} {'REMAIN':>8}  {'RESET':<12} {'PACE':<12} EST. LEFT")
-    print("-" * 116)
+ROW_SEPARATOR = object()
+TABLE_HEADERS = ("SERVICE", "LIMIT", "PLAN", "USED", "REMAIN", "RESET", "PACE", "EST. LEFT")
+TABLE_ALIGNS = ("left", "left", "left", "right", "right", "left", "left", "left")
+MAX_CELL_WIDTH = 34
+# 残量に応じた警告色。REMAIN / PACE / EST. LEFT の3列だけ塗り、他は既定色のままにする。
+REMAIN_COLUMN, PACE_COLUMN, ESTIMATE_COLUMN = 4, 6, 7
+ANSI_CODES = {"red": "\033[91m", "yellow": "\033[93m"}
+ANSI_RESET = "\033[0m"
+# 「残りわずか」の境界。25%以下で黄、10%以下で赤。
+WARN_PERCENT = 25.0
+CRITICAL_PERCENT = 10.0
+CRITICAL_PACE = ("枯渇寸前",)
+WARN_PACE = ("残りわずか", "枯渇懸念", "やや速い")
+
+
+def display_width(text: str) -> int:
+    """全角文字を2桁として数える。日本語混在でも罫線を揃えるために必要。"""
+    return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
+
+
+def pad_cell(text: str, width: int, align: str) -> str:
+    space = " " * max(0, width - display_width(text))
+    return space + text if align == "right" else text + space
+
+
+def clip_cell(text: str, limit: int = MAX_CELL_WIDTH) -> str:
+    """長いエラー文で表全体が横に伸びないよう、表示幅で丸める。全文は表の下に出す。"""
+    if display_width(text) <= limit:
+        return text
+    clipped = ""
+    for char in text:
+        if display_width(clipped + char) > limit - 1:
+            break
+        clipped += char
+    return clipped + "…"
+
+
+def percent_severity(remaining: float | None) -> str | None:
+    if remaining is None:
+        return None
+    if remaining <= CRITICAL_PERCENT:
+        return "red"
+    if remaining <= WARN_PERCENT:
+        return "yellow"
+    return None
+
+
+def pace_severity(pace: str) -> str | None:
+    """ペース警告は残量とは別の軸なので、PACE列だけを塗る。残量が潤沢でも
+    消費が速ければ黄色にしたいが、REMAINまで黄色にすると誤解を招くため分ける。"""
+    if pace in CRITICAL_PACE:
+        return "red"
+    if pace in WARN_PACE:
+        return "yellow"
+    return None
+
+
+def color_enabled(stream: Any = None) -> bool:
+    stream = stream if stream is not None else sys.stdout
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def paint(text: str, color: str | None) -> str:
+    return f"{ANSI_CODES[color]}{text}{ANSI_RESET}" if color else text
+
+
+def render_table(headers: tuple[str, ...], rows: list[Any], aligns: tuple[str, ...], use_color: bool = False) -> str:
+    prepared = [row if row is ROW_SEPARATOR else (tuple(clip_cell(cell) for cell in row[0]), row[1]) for row in rows]
+    widths = [display_width(header) for header in headers]
+    for row in prepared:
+        if row is ROW_SEPARATOR:
+            continue
+        for index, cell in enumerate(row[0]):
+            widths[index] = max(widths[index], display_width(cell))
+
+    def line(left: str, fill: str, cross: str, right: str) -> str:
+        return left + cross.join(fill * (width + 2) for width in widths) + right
+
+    def body(cells: tuple[str, ...], colors: dict[int, str | None] | None = None) -> str:
+        padded = [pad_cell(cell, widths[i], aligns[i]) for i, cell in enumerate(cells)]
+        if use_color and colors:
+            # パディング後に着色する。制御文字を幅計算に混ぜないための順序。
+            padded = [paint(cell, colors.get(i)) for i, cell in enumerate(padded)]
+        return "│ " + " │ ".join(padded) + " │"
+
+    out = [line("┌", "─", "┬", "┐"), body(headers), line("├", "─", "┼", "┤")]
+    for row in prepared:
+        out.append(line("├", "─", "┼", "┤") if row is ROW_SEPARATOR else body(row[0], row[1]))
+    out.append(line("└", "─", "┴", "┘"))
+    return "\n".join(out)
+
+
+def table_rows(results: list[dict[str, Any]]) -> tuple[list[Any], dict[str, list[float]]]:
+    rows: list[Any] = []
     service_scores: dict[str, list[float]] = {}
     for result in results:
+        if rows:
+            rows.append(ROW_SEPARATOR)
         if not result["ok"]:
-            print(f"{result['service']:<9} {'ERROR':<28} {'-':<14} {'-':>7} {'-':>8}  {'-':<12} {'-':<12} {result['error']}")
+            cells = (result["service"], "ERROR", "-", "-", "-", "-", "-", result["error"])
+            rows.append((cells, {1: "red", ESTIMATE_COLUMN: "red"}))
             continue
         plan = capacity_text(result["service"], result.get("plan"))
-        rows = result.get("windows", [])
+        windows = result.get("windows", [])
         if result["service"] == "agy" and "data" in result:
-            rows = [{"name": n, "remaining_percent": p, "resets_at": r} for n, p, r in flatten_agy(result["data"])]
-            rows = consolidate_gemini_rows(rows)
-        if not rows:
-            print(f"{result['service']:<9} {'取得済み（表示可能な枠なし）':<28}")
-        for row in rows:
+            windows = [{"name": n, "remaining_percent": p, "resets_at": r} for n, p, r in flatten_agy(result["data"])]
+            windows = consolidate_gemini_rows(windows)
+        if not windows:
+            rows.append(((result["service"], "取得済み（表示可能な枠なし）", plan, "-", "-", "-", "-", "-"), {}))
+        for row in windows:
             remaining = row.get("remaining_percent")
             if remaining is None:
                 # 残量を返さない枠（Antigravity の Gemini 系）。枠の存在とリセット時刻は表示する。
@@ -891,7 +990,29 @@ def print_table(results: list[dict[str, Any]]) -> None:
                 remaining_text = f"{remaining:.1f}%"
                 estimate, points = estimated_left_text(result["service"], result.get("plan"), remaining, str(row["name"]))
                 service_scores.setdefault(result["service"], []).append(points)
-            print(f"{result['service']:<9} {str(row['name']):<28.28} {plan:<14.14} {used_text:>7} {remaining_text:>8}  {reset_text(row.get('resets_at')):<12} {pace_text(row):<12} {estimate}")
+            pace = pace_text(row)
+            cells = (
+                result["service"], str(row["name"]), plan, used_text, remaining_text,
+                reset_text(row.get("resets_at")), pace, estimate,
+            )
+            level = percent_severity(remaining)
+            rows.append((cells, {
+                REMAIN_COLUMN: level,
+                PACE_COLUMN: pace_severity(pace),
+                ESTIMATE_COLUMN: level,
+            }))
+    return rows, service_scores
+
+
+def print_table(results: list[dict[str, Any]], use_color: bool | None = None) -> None:
+    use_color = color_enabled() if use_color is None else use_color
+    rows, service_scores = table_rows(results)
+    print(render_table(TABLE_HEADERS, rows, TABLE_ALIGNS, use_color))
+    failures = [result for result in results if not result["ok"]]
+    if failures:
+        print("\nエラー詳細:")
+        for result in failures:
+            print(f"  {paint(result['service'], 'red' if use_color else None)}: {result['error']}")
     scores = {service: sum(values) / len(values) for service, values in service_scores.items() if values}
     if len(scores) > 1:
         ranking = " > ".join(f"{service} ({score:.0f}pt)" for service, score in sorted(scores.items(), key=lambda item: item[1], reverse=True))
@@ -903,6 +1024,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Codex / Claude Code / agy / Grok の残り使用量を一覧表示")
     parser.add_argument("--json", action="store_true", help="機械可読なJSONを出力")
     parser.add_argument("--service", choices=("codex", "claude", "agy", "grok"), action="append", help="対象を限定（複数指定可）")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="残量警告の色付け（既定: 端末出力時のみ）")
     args = parser.parse_args()
     selected = args.service or ["codex", "claude", "agy", "grok"]
     checkers = {"codex": codex_usage, "claude": claude_usage, "agy": agy_usage, "grok": grok_usage}
@@ -915,7 +1037,8 @@ def main() -> int:
     if args.json:
         print(json.dumps({"checked_at": datetime.now().astimezone().isoformat(), "services": results}, ensure_ascii=False, indent=2))
     else:
-        print_table(results)
+        use_color = color_enabled() if args.color == "auto" else args.color == "always"
+        print_table(results, use_color)
     return 0 if all(item["ok"] for item in results) else 1
 
 
