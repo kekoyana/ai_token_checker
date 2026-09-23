@@ -53,7 +53,8 @@ ai-usage
 - Codex: `codex app-server` の公式 `account/rateLimits/read` API
 - Claude Code: Claude CodeのローカルOAuth認証を使う使用量API
   - 5時間枠・7日枠に加え、応答の `limits` 配列にあるモデル別の週間枠（`7日 Fable` など）も1行ずつ表示します。Fable 5.1のような上位モデルは全体の7日枠とは別に専用の週間枠を持つため、この行で残量とリセット時刻を確認できます。
-- GitHub Copilot: GitHub CLIの認証を使い、GitHubの内部利用枠APIから月次のPremium requests、Chat、Completionsを取得
+- GitHub Copilot: GitHub CLIの認証を使い、GitHubの内部利用枠APIから月次のAI Credits（旧課金方式ではPremium requests）、Chat、Completionsを取得
+  - AI Credits方式では小数付き残量を優先し、割合は小数2桁、`EST. LEFT` は実残量 / 月次枠（`cr`）を表示します。Pro+はAPIの契約SKUで判別します。
   - 無制限の枠は表示せず、上限がある枠だけを表示します。このAPIは非公開仕様のため、GitHub側の変更で利用できなくなる可能性があります。
 - agy: `antigravity-usage quota --json`（Antigravity IDEへのローカル接続、または補助CLI独自のOAuth認証）
   - Gemini系モデルはすべて同一のクォータ枠（共通プール）を共有するため、「Gemini (共通枠)」として1行に集約して表示します（Gemini 3.8 Flashなど新モデルが追加されても自動で集約されます）。残量APIが数値を返さない場合はREMAINは「不明」となります。
@@ -69,7 +70,11 @@ agyが `Individual quota reached` で止まる場合、`Resets in ...` の残り
 
 Claude行が `APIエラー HTTP 429` になる場合は、使用量エンドポイントのレート枠（アカウント単位・スライディング型）に達しています。**触るほど解けにくくなる**ため、約1時間放置してから1回だけ再実行してください。詳細は [docs/claude-429-rate-limit.md](docs/claude-429-rate-limit.md)。
 
-`USED` と `REMAIN` はAPIから取得した実際の割合です。`PACE` はウィンドウの経過時間と使用率から、現在のペースでリセットまで持つかを推定します。Claudeの `EST. LEFT` はAnthropic公表のプラン別目安から、5時間枠を推定プロンプト数の中央値、週間枠をSonnet 1時間＝2pt・Opus 1時間＝10ptとして共通ポイントへ換算します。公表目安のないモデル別枠（`7日 Fable` など）はプラン容量からの汎用換算になるため、他のClaude行より粗い参考値です。他サービスのポイントと概算順位も仮の容量配点による参考値で、実際のタスク内容によって大きく外れる可能性があります。
+Copilot CLIを使っても割合が変わらない場合、`EST. LEFT` のクレジット残量を確認してください。APIの `percent_remaining` は小数1桁に丸められており、7,000 creditsの枠では0.1%が7 creditsに相当します。本ツールはAI Credits方式の `quota_remaining` から割合を計算し、微小な消費を実残量でも確認できるようにしています。毎回APIへ問い合わせますが、GitHub側のキャッシュや集計の反映までは保証できません。`--json` の `snapshot_at` はAPI応答のスナップショット時刻で、最後に使用量が集計された時刻とは限りません。なお、本ツールはGitHub CLIのアカウントを参照するため、Copilot CLIで利用中のアカウントと同じか確認してください。現行の課金方式は [GitHubの公式説明](https://docs.github.com/en/copilot/concepts/billing-and-usage/individuals/billing) を参照してください。
+
+Copilotの月次クレジットが残っていても、CLI側で別のChat枠が消費され、HTTP 402になる事象も確認しています。表示精度の修正だけでは解消しません。調査結果と切り分け手順は [docs/copilot-quota-mismatch.md](docs/copilot-quota-mismatch.md)。
+
+`USED` と `REMAIN` はAPIの割合、またはAPIの実残量から計算した割合です。`PACE` はウィンドウの経過時間と使用率から、現在のペースでリセットまで持つかを推定します。Claudeの `EST. LEFT` はAnthropic公表のプラン別目安から、5時間枠を推定プロンプト数の中央値、週間枠をSonnet 1時間＝2pt・Opus 1時間＝10ptとして共通ポイントへ換算します。公表目安のないモデル別枠（`7日 Fable` など）はプラン容量からの汎用換算になるため、他のClaude行より粗い参考値です。他サービスのポイントと概算順位も仮の容量配点による参考値で、実際のタスク内容によって大きく外れる可能性があります。
 
 APIからプランを取得できない場合は、Git管理されない `.usage_check.local.json` で指定できます。
 

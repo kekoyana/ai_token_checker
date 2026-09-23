@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -234,31 +235,52 @@ def copilot_windows(raw: dict[str, Any]) -> list[dict[str, Any]]:
         "completions": "Completions",
     }
     windows = []
+
+    def number(value: Any) -> float | None:
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) else None
+        except (TypeError, ValueError):
+            return None
+
     for key, label in labels.items():
         item = snapshots.get(key)
         if not isinstance(item, dict) or item.get("unlimited"):
             continue
-        remaining = item.get("percent_remaining")
-        if remaining is None:
-            entitlement = item.get("entitlement")
-            quota_remaining = item.get("remaining")
-            if quota_remaining is None:
-                quota_remaining = item.get("quota_remaining")
-            try:
-                if float(entitlement) > 0 and quota_remaining is not None:
-                    remaining = float(quota_remaining) / float(entitlement) * 100.0
-            except (TypeError, ValueError):
-                remaining = None
-        if remaining is None:
+        # Code completions keep a request quota even on credit-billed Free plans.
+        token_billing = key != "completions" and item.get("token_based_billing", raw.get("token_based_billing", False)) is True
+        entitlement = number(item.get("entitlement"))
+        # `remaining` is an integer in credit billing; `quota_remaining` retains
+        # fractions. The API's percent_remaining is rounded to just one decimal.
+        quota_remaining = number(item.get("quota_remaining"))
+        if quota_remaining is None:
+            quota_remaining = number(item.get("remaining"))
+        has_quantity = entitlement is not None and entitlement > 0 and quota_remaining is not None
+        remaining = number(item.get("percent_remaining"))
+        if has_quantity and (token_billing or remaining is None):
+            remaining = quota_remaining / entitlement * 100.0
+        # Some token-billed accounts return a zero-entitlement placeholder with
+        # 100% remaining. It is not evidence of an unused allowance.
+        if token_billing and (item.get("has_quota") is False or entitlement == 0):
+            remaining = None
+            has_quantity = False
+        if remaining is None and not token_billing:
             continue
-        remaining_percent = max(0.0, min(100.0, float(remaining)))
-        windows.append({
-            "name": label,
+        remaining_percent = max(0.0, min(100.0, remaining)) if remaining is not None else None
+        window = {
+            "name": "AI credits" if token_billing and key in ("premium_interactions", "chat") else label,
             "remaining_percent": remaining_percent,
-            "used_percent": 100.0 - remaining_percent,
+            "used_percent": 100.0 - remaining_percent if remaining_percent is not None else None,
             "resets_at": item.get("quota_reset_at") or reset,
             "window_minutes": 43200,
-        })
+        }
+        if token_billing:
+            window["unit"] = "credits"
+            if has_quantity:
+                window.update({"remaining": quota_remaining, "entitlement": entitlement})
+            if item.get("timestamp_utc"):
+                window["snapshot_at"] = item["timestamp_utc"]
+        windows.append(window)
     return windows
 
 
@@ -278,10 +300,14 @@ def copilot_usage() -> dict[str, Any]:
             raw = json.load(response)
         if not isinstance(raw, dict):
             raise RuntimeError("Copilot APIの応答形式が不正です")
+        plan = raw.get("copilot_plan") or raw.get("access_type_sku")
+        # Pro and Pro+ can both report individual_pro; the SKU distinguishes them.
+        if str(raw.get("access_type_sku", "")).startswith("plus_"):
+            plan = "pro_plus"
         return {
             "service": "copilot",
             "ok": True,
-            "plan": raw.get("copilot_plan") or raw.get("access_type_sku"),
+            "plan": plan,
             "windows": copilot_windows(raw),
         }
     except urllib.error.HTTPError as exc:
@@ -820,6 +846,8 @@ def capacity_text(service: str, plan: Any) -> str:
             return "Enterprise"
         if "business" in normalized:
             return "Business"
+        if "pro_plus" in normalized or "pro+" in normalized or normalized.startswith("plus_"):
+            return "Pro+"
         if "pro" in normalized or "individual" in normalized:
             return "Pro"
         if "free" in normalized:
@@ -1081,10 +1109,13 @@ def table_rows(results: list[dict[str, Any]]) -> tuple[list[Any], dict[str, list
                 # 残量を返さない枠（Antigravity の Gemini 系）。枠の存在とリセット時刻は表示する。
                 used_text, remaining_text, estimate = "-", "不明", "残量API未提供"
             else:
-                used_text = f"{100.0 - remaining:.1f}%"
-                remaining_text = f"{remaining:.1f}%"
+                precision = 2 if row.get("unit") == "credits" else 1
+                used_text = f"{100.0 - remaining:.{precision}f}%"
+                remaining_text = f"{remaining:.{precision}f}%"
                 estimate, points = estimated_left_text(result["service"], result.get("plan"), remaining, str(row["name"]))
                 service_scores.setdefault(result["service"], []).append(points)
+                if row.get("unit") == "credits" and row.get("remaining") is not None and row.get("entitlement") is not None:
+                    estimate = f"{row['remaining']:,.1f} / {row['entitlement']:,.1f} cr"
             pace = pace_text(row)
             cells = (
                 result["service"], str(row["name"]), plan, used_text, remaining_text,
