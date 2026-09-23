@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from usage_check import (
     ANSI_RESET,
+    COPILOT_USAGE_URL,
     GROK_SUBSCRIPTIONS_URL,
     agy_usage,
     display_width,
@@ -15,6 +16,8 @@ from usage_check import (
     percent_severity,
     capacity_text,
     claude_windows,
+    copilot_usage,
+    copilot_windows,
     estimated_left_text,
     flatten_agy,
     grok_billing_windows,
@@ -292,6 +295,65 @@ class AgyUsageTests(unittest.TestCase):
         now = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
         row = {"remaining_percent": 100.0, "resets_at": "2026-08-30T16:00:00Z", "window_minutes": 300}
         self.assertEqual(pace_text(row, now), "余裕あり")
+
+
+class CopilotUsageTests(unittest.TestCase):
+    def test_windows_include_finite_quotas_and_skip_unlimited(self):
+        raw = {
+            "quota_reset_date_utc": "2026-10-01T00:00:00Z",
+            "quota_snapshots": {
+                "chat": {"unlimited": True, "percent_remaining": 100},
+                "completions": {"unlimited": False, "entitlement": 50, "remaining": 25},
+                "premium_interactions": {
+                    "unlimited": False,
+                    "entitlement": 300,
+                    "remaining": 120,
+                    "percent_remaining": 40,
+                },
+            },
+        }
+
+        windows = copilot_windows(raw)
+
+        self.assertEqual([window["name"] for window in windows], ["Premium requests", "Completions"])
+        self.assertEqual(windows[0]["remaining_percent"], 40.0)
+        self.assertEqual(windows[0]["resets_at"], "2026-10-01T00:00:00Z")
+        self.assertEqual(windows[0]["window_minutes"], 43200)
+        self.assertEqual(windows[1]["remaining_percent"], 50.0)
+
+    def test_zero_remaining_is_preserved(self):
+        raw = {
+            "quota_snapshots": {
+                "premium_interactions": {
+                    "unlimited": False,
+                    "entitlement": 300,
+                    "remaining": 0,
+                },
+            },
+        }
+        self.assertEqual(copilot_windows(raw)[0]["remaining_percent"], 0.0)
+
+    @patch("usage_check.copilot_access_token", return_value="token")
+    @patch("usage_check.urllib.request.urlopen")
+    def test_usage_reports_plan_and_windows(self, urlopen, _token):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = StringIO(json.dumps({
+            "copilot_plan": "individual_pro",
+            "quota_reset_date_utc": "2026-10-01T00:00:00Z",
+            "quota_snapshots": {
+                "premium_interactions": {"percent_remaining": 99.6, "unlimited": False},
+            },
+        }))
+        urlopen.return_value = response
+
+        result = copilot_usage()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["plan"], "individual_pro")
+        self.assertEqual(result["windows"][0]["remaining_percent"], 99.6)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, COPILOT_USAGE_URL)
+        self.assertEqual(request.get_header("Authorization"), "Bearer token")
 
 
 class GrokUsageTests(unittest.TestCase):

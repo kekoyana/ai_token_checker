@@ -1,6 +1,6 @@
 # AI Usage Check
 
-Codex、Claude Code、Antigravity CLI (`agy`)、Grok Build (`grok`) の残り使用量を1つの表にまとめるmacOS/Linux向けCLIです。認証トークンは標準出力にもファイルにも保存しません。
+Codex、Claude Code、GitHub Copilot、Antigravity CLI (`agy`)、Grok Build (`grok`) の残り使用量を1つの表にまとめるmacOS/Linux向けCLIです。認証トークンは標準出力にもファイルにも保存しません。
 
 ## セットアップ
 
@@ -23,7 +23,13 @@ Grokは Grok Build CLI (`@xai-official/grok`) のログイン情報（`~/.grok/a
 grok login
 ```
 
-補助CLIやGrok CLIがなくてもCodexとClaude Codeのチェックは動作します。
+GitHub CopilotはGitHub CLIのログイン情報を利用します。未ログインなら一度ログインしてください。
+
+```sh
+gh auth login
+```
+
+補助CLIやGrok CLIがなくてもCodex、Claude Code、GitHub Copilotのチェックは動作します。
 
 このディレクトリの外から `ai-usage` として使う場合:
 
@@ -38,6 +44,7 @@ ai-usage
 ./usage_check.py
 ./usage_check.py --json
 ./usage_check.py --service codex --service claude
+./usage_check.py --service copilot
 ./usage_check.py --service grok
 ```
 
@@ -46,6 +53,8 @@ ai-usage
 - Codex: `codex app-server` の公式 `account/rateLimits/read` API
 - Claude Code: Claude CodeのローカルOAuth認証を使う使用量API
   - 5時間枠・7日枠に加え、応答の `limits` 配列にあるモデル別の週間枠（`7日 Fable` など）も1行ずつ表示します。Fable 5.1のような上位モデルは全体の7日枠とは別に専用の週間枠を持つため、この行で残量とリセット時刻を確認できます。
+- GitHub Copilot: GitHub CLIの認証を使い、GitHubの内部利用枠APIから月次のPremium requests、Chat、Completionsを取得
+  - 無制限の枠は表示せず、上限がある枠だけを表示します。このAPIは非公開仕様のため、GitHub側の変更で利用できなくなる可能性があります。
 - agy: `antigravity-usage quota --json`（Antigravity IDEへのローカル接続、または補助CLI独自のOAuth認証）
   - Gemini系モデルはすべて同一のクォータ枠（共通プール）を共有するため、「Gemini (共通枠)」として1行に集約して表示します（Gemini 3.8 Flashなど新モデルが追加されても自動で集約されます）。残量APIが数値を返さない場合はREMAINは「不明」となります。
 - Grok: Grok Build CLIのOAuth認証（`~/.grok/auth.json`）で課金APIと契約APIを参照。アクセストークンが期限切れならリフレッシュトークンで自動更新します（更新後のトークンはメモリ上のみで、ファイルへは書き戻しません）
@@ -80,5 +89,5 @@ APIからプランを取得できない場合は、Git管理されない `.usage
 
 - `.env` とその派生ファイル
 - OAuthトークン、APIキー、秘密鍵
-- `~/.claude/`、`~/.codex/`、`~/.gemini/`、`~/.grok/` 内のファイル
+- `~/.claude/`、`~/.codex/`、`~/.gemini/`、`~/.grok/`、GitHub CLI内の認証ファイル
 - `~/Library/Application Support/antigravity-usage/` 内のファイル

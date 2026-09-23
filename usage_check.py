@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Show remaining usage for Codex, Claude Code, Antigravity CLI, and Grok Build."""
+"""Show remaining usage for Codex, Claude Code, Copilot, Antigravity CLI, and Grok Build."""
 
 from __future__ import annotations
 
@@ -26,12 +26,14 @@ GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing"
 GROK_SUBSCRIPTIONS_URL = "https://grok.com/rest/subscriptions"
 GROK_OIDC_TOKEN_URL = "https://auth.x.ai/oauth2/token"
 GROK_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+COPILOT_USAGE_URL = "https://api.github.com/copilot_internal/user"
 
 # Deliberately rough, cross-service capacity points. These are comparison aids,
 # not vendor-published token or request limits.
 CAPACITY_POINTS = {
     "codex": {"free": 20, "go": 50, "plus": 100, "pro": 1000, "business": 250, "enterprise": 1000, "edu": 250},
     "claude": {"free": 20, "pro": 100, "max_5x": 500, "max_20x": 2000, "team": 500, "enterprise": 1000},
+    "copilot": {"free": 20, "pro": 100, "business": 250, "enterprise": 1000},
     "agy": {"free": 20, "ai_pro": 100, "pro": 100, "ultra_5x": 500, "ultra_20x": 2000, "enterprise": 1000},
     "grok": {
         "free": 20,
@@ -202,6 +204,90 @@ def claude_usage() -> dict[str, Any]:
         return error("claude", f"APIエラー HTTP {exc.code}")
     except Exception as exc:
         return error("claude", str(exc))
+
+
+def copilot_access_token() -> str:
+    for name in ("COPILOT_GITHUB_TOKEN", "GITHUB_COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        token = os.environ.get(name)
+        if token and token.strip():
+            return token.strip()
+    if not shutil.which("gh"):
+        raise RuntimeError("GitHub CLIが見つかりません（gh auth loginを実行してください）")
+    completed = subprocess.run(
+        ["gh", "auth", "token"], capture_output=True, text=True, timeout=5
+    )
+    token = completed.stdout.strip()
+    if completed.returncode != 0 or not token:
+        detail = completed.stderr.strip() or "GitHubの認証情報が見つかりません"
+        raise RuntimeError(f"{detail}（gh auth loginを実行してください）")
+    return token
+
+
+def copilot_windows(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    snapshots = raw.get("quota_snapshots")
+    if not isinstance(snapshots, dict):
+        return []
+    reset = raw.get("quota_reset_date_utc") or raw.get("quota_reset_date") or raw.get("limited_user_reset_date")
+    labels = {
+        "premium_interactions": "Premium requests",
+        "chat": "Chat",
+        "completions": "Completions",
+    }
+    windows = []
+    for key, label in labels.items():
+        item = snapshots.get(key)
+        if not isinstance(item, dict) or item.get("unlimited"):
+            continue
+        remaining = item.get("percent_remaining")
+        if remaining is None:
+            entitlement = item.get("entitlement")
+            quota_remaining = item.get("remaining")
+            if quota_remaining is None:
+                quota_remaining = item.get("quota_remaining")
+            try:
+                if float(entitlement) > 0 and quota_remaining is not None:
+                    remaining = float(quota_remaining) / float(entitlement) * 100.0
+            except (TypeError, ValueError):
+                remaining = None
+        if remaining is None:
+            continue
+        remaining_percent = max(0.0, min(100.0, float(remaining)))
+        windows.append({
+            "name": label,
+            "remaining_percent": remaining_percent,
+            "used_percent": 100.0 - remaining_percent,
+            "resets_at": item.get("quota_reset_at") or reset,
+            "window_minutes": 43200,
+        })
+    return windows
+
+
+def copilot_usage() -> dict[str, Any]:
+    try:
+        token = copilot_access_token()
+        request = urllib.request.Request(
+            COPILOT_USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "usage-check/0.1",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            raw = json.load(response)
+        if not isinstance(raw, dict):
+            raise RuntimeError("Copilot APIの応答形式が不正です")
+        return {
+            "service": "copilot",
+            "ok": True,
+            "plan": raw.get("copilot_plan") or raw.get("access_type_sku"),
+            "windows": copilot_windows(raw),
+        }
+    except urllib.error.HTTPError as exc:
+        return error("copilot", f"APIエラー HTTP {exc.code}")
+    except Exception as exc:
+        return error("copilot", str(exc))
 
 
 def agy_infer_window_minutes(time_until_reset_ms: Any, remaining: float | None) -> int | None:
@@ -729,6 +815,15 @@ def capacity_text(service: str, plan: Any) -> str:
             return "Free"
         if "edu" in normalized:
             return "Edu"
+    elif service == "copilot":
+        if "enterprise" in normalized:
+            return "Enterprise"
+        if "business" in normalized:
+            return "Business"
+        if "pro" in normalized or "individual" in normalized:
+            return "Pro"
+        if "free" in normalized:
+            return "Free"
     elif service == "grok":
         if "heavy" in normalized:
             return "SuperGrok Heavy"
@@ -1021,13 +1116,19 @@ def print_table(results: list[dict[str, Any]], use_color: bool | None = None) ->
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Codex / Claude Code / agy / Grok の残り使用量を一覧表示")
+    parser = argparse.ArgumentParser(description="Codex / Claude Code / Copilot / agy / Grok の残り使用量を一覧表示")
     parser.add_argument("--json", action="store_true", help="機械可読なJSONを出力")
-    parser.add_argument("--service", choices=("codex", "claude", "agy", "grok"), action="append", help="対象を限定（複数指定可）")
+    parser.add_argument("--service", choices=("codex", "claude", "copilot", "agy", "grok"), action="append", help="対象を限定（複数指定可）")
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="残量警告の色付け（既定: 端末出力時のみ）")
     args = parser.parse_args()
-    selected = args.service or ["codex", "claude", "agy", "grok"]
-    checkers = {"codex": codex_usage, "claude": claude_usage, "agy": agy_usage, "grok": grok_usage}
+    selected = args.service or ["codex", "claude", "copilot", "agy", "grok"]
+    checkers = {
+        "codex": codex_usage,
+        "claude": claude_usage,
+        "copilot": copilot_usage,
+        "agy": agy_usage,
+        "grok": grok_usage,
+    }
     results = [checkers[name]() for name in selected]
     plans = load_local_config().get("plans", {})
     if isinstance(plans, dict):
