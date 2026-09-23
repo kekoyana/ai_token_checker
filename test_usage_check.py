@@ -298,6 +298,104 @@ class AgyUsageTests(unittest.TestCase):
 
 
 class CopilotUsageTests(unittest.TestCase):
+    def credit_payload(self, remaining=5824.6):
+        return {
+            "copilot_plan": "individual_pro",
+            "access_type_sku": "plus_monthly_subscriber_quota",
+            "token_based_billing": True,
+            "quota_reset_date_utc": "2026-10-01T00:00:00Z",
+            "quota_snapshots": {
+                "chat": {"unlimited": True},
+                "completions": {"unlimited": True},
+                "premium_interactions": {
+                    "unlimited": False,
+                    "has_quota": True,
+                    "token_based_billing": True,
+                    "entitlement": 7000,
+                    "quota_remaining": remaining,
+                    "remaining": int(remaining),
+                    "percent_remaining": 83.2,
+                    "timestamp_utc": "2026-09-23T05:21:52Z",
+                },
+            },
+        }
+
+    def test_credit_balance_retains_fraction_and_detects_small_changes(self):
+        before = copilot_windows(self.credit_payload())[0]
+        after = copilot_windows(self.credit_payload(5824.2))[0]
+
+        self.assertEqual(before["name"], "AI credits")
+        self.assertEqual(before["remaining"], 5824.6)
+        self.assertEqual(before["entitlement"], 7000)
+        self.assertEqual(before["unit"], "credits")
+        self.assertEqual(before["snapshot_at"], "2026-09-23T05:21:52Z")
+        self.assertAlmostEqual(before["remaining_percent"], 5824.6 / 7000 * 100)
+        self.assertLess(after["remaining_percent"], before["remaining_percent"])
+        outputs = []
+        for window in (before, after):
+            output = StringIO()
+            with redirect_stdout(output):
+                print_table([{"service": "copilot", "ok": True, "plan": "pro_plus", "windows": [window]}], use_color=False)
+            outputs.append(output.getvalue())
+        self.assertIn("5,824.6 / 7,000.0 cr", outputs[0])
+        self.assertIn("5,824.2 / 7,000.0 cr", outputs[1])
+        self.assertIn("83.21%", outputs[0])
+        self.assertIn("Pro+", outputs[0])
+        lines = [line for line in outputs[0].splitlines() if line.startswith(("┌", "│", "├", "└"))]
+        self.assertEqual(len({display_width(line) for line in lines}), 1)
+
+    def test_credit_billing_flag_can_come_from_either_level(self):
+        for level in ("account", "snapshot"):
+            with self.subTest(level=level):
+                raw = self.credit_payload()
+                if level == "account":
+                    del raw["quota_snapshots"]["premium_interactions"]["token_based_billing"]
+                else:
+                    del raw["token_based_billing"]
+                self.assertEqual(copilot_windows(raw)[0]["name"], "AI credits")
+
+    def test_credit_remaining_falls_back_to_integer_or_reported_percent(self):
+        for invalid in (None, "invalid", float("nan"), float("inf")):
+            with self.subTest(invalid=invalid):
+                raw = self.credit_payload()
+                item = raw["quota_snapshots"]["premium_interactions"]
+                item["quota_remaining"] = invalid
+                window = copilot_windows(raw)[0]
+                self.assertEqual(window["remaining"], 5824)
+                del item["remaining"]
+                window = copilot_windows(raw)[0]
+                self.assertEqual(window["remaining_percent"], 83.2)
+                self.assertNotIn("remaining", window)
+
+    def test_empty_credit_quota_is_unknown_not_full(self):
+        for change in ({"entitlement": 0}, {"has_quota": False}):
+            with self.subTest(change=change):
+                raw = self.credit_payload()
+                raw["quota_snapshots"]["premium_interactions"].update(change)
+                window = copilot_windows(raw)[0]
+                self.assertIsNone(window["remaining_percent"])
+                self.assertIsNone(window["used_percent"])
+                self.assertNotIn("remaining", window)
+
+    def test_zero_credit_balance_overrides_stale_percent(self):
+        window = copilot_windows(self.credit_payload(0))[0]
+        self.assertEqual(window["remaining"], 0)
+        self.assertEqual(window["remaining_percent"], 0)
+        self.assertEqual(window["used_percent"], 100)
+
+    def test_completions_are_not_credit_billed(self):
+        raw = self.credit_payload()
+        raw["quota_snapshots"]["completions"] = {
+            "unlimited": False,
+            "token_based_billing": True,
+            "entitlement": 2000,
+            "remaining": 1500,
+        }
+        window = copilot_windows(raw)[1]
+        self.assertEqual(window["name"], "Completions")
+        self.assertEqual(window["remaining_percent"], 75)
+        self.assertNotIn("unit", window)
+
     def test_windows_include_finite_quotas_and_skip_unlimited(self):
         raw = {
             "quota_reset_date_utc": "2026-10-01T00:00:00Z",
@@ -354,6 +452,19 @@ class CopilotUsageTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(request.full_url, COPILOT_USAGE_URL)
         self.assertEqual(request.get_header("Authorization"), "Bearer token")
+
+    @patch("usage_check.copilot_access_token", return_value="token")
+    @patch("usage_check.urllib.request.urlopen")
+    def test_usage_distinguishes_pro_plus_from_generic_individual_plan(self, urlopen, _token):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = StringIO(json.dumps(self.credit_payload()))
+        urlopen.return_value = response
+
+        result = copilot_usage()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(capacity_text("copilot", result["plan"]), "Pro+")
+        self.assertEqual(result["windows"][0]["remaining"], 5824.6)
 
 
 class GrokUsageTests(unittest.TestCase):
