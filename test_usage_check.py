@@ -230,6 +230,7 @@ class AgyUsageTests(unittest.TestCase):
         run.return_value.stdout = json.dumps({
             "models": [
                 {"label": "Claude Opus 4.6 (Thinking)", "remainingPercentage": 1.0, "resetTime": "2026-09-03T06:42:38Z"},
+                {"label": "Claude Sonnet 4.6 (Thinking)", "remainingPercentage": 0.8, "resetTime": "2026-09-03T06:40:00Z"},
                 {"label": "Gemini 2.5 Pro", "modelId": "gemini-2.5-pro", "remainingPercentage": 0.95, "resetTime": "2026-09-03T06:41:42Z"},
                 {"label": "Gemini 3 Flash", "modelId": "gemini-3-flash", "remainingPercentage": 0.95, "resetTime": "2026-09-03T06:41:42Z"},
                 {"label": "Gemini 3.8 Flash (Medium)", "modelId": "gemini-3.8-flash-medium", "remainingPercentage": 0.95, "resetTime": "2026-09-03T06:41:42Z"},
@@ -243,7 +244,9 @@ class AgyUsageTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         windows = result["windows"]
         self.assertEqual(len(windows), 3)
-        self.assertEqual(windows[0]["name"], "Claude Opus 4.6 (Thinking)")
+        self.assertEqual(windows[0]["name"], "Claude (共通枠)")
+        self.assertEqual(windows[0]["remaining_percent"], 80.0)
+        self.assertEqual(windows[0]["resets_at"], "2026-09-03T06:40:00Z")
         self.assertEqual(windows[1]["name"], "Gemini (共通枠)")
         self.assertEqual(windows[1]["remaining_percent"], 95.0)
         self.assertEqual(windows[1]["resets_at"], "2026-09-03T06:41:42Z")
