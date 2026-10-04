@@ -363,14 +363,44 @@ def is_gemini_entry(item: dict[str, Any] | str) -> bool:
     return False
 
 
+def is_claude_entry(item: dict[str, Any] | str) -> bool:
+    """判定対象の名前や識別子に claude が含まれるか判定する。"""
+    if isinstance(item, str):
+        return "claude" in item.lower()
+    if isinstance(item, dict):
+        text = " ".join(
+            str(item.get(k) or "")
+            for k in ("name", "label", "modelId", "id")
+        ).lower()
+        return "claude" in text
+    return False
+
+
 def consolidate_gemini_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Gemini系モデルはすべて同一のクォータ枠を共有するため、1つの共通枠に集約する。"""
-    gemini_rows = [r for r in rows if is_gemini_entry(r)]
-    if not gemini_rows:
+    return consolidate_shared_rows(rows, is_gemini_entry, "Gemini (共通枠)")
+
+
+def consolidate_claude_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Claude系モデル（Sonnet/Opus等）はすべて同一のクォータ枠を共有するため、1つの共通枠に集約する。"""
+    return consolidate_shared_rows(rows, is_claude_entry, "Claude (共通枠)")
+
+
+def consolidate_agy_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """agyのGemini系・Claude系をそれぞれ共通枠にまとめる。"""
+    return consolidate_claude_rows(consolidate_gemini_rows(rows))
+
+
+def consolidate_shared_rows(
+    rows: list[dict[str, Any]], predicate: Any, label: str
+) -> list[dict[str, Any]]:
+    """predicateに一致する行を、最小残量・最早リセットの1行にまとめる。"""
+    matched_rows = [r for r in rows if predicate(r)]
+    if not matched_rows:
         return rows
 
-    any_zero = any(r.get("remaining_percent") == 0.0 for r in gemini_rows)
-    valid_pcts = [r["remaining_percent"] for r in gemini_rows if r.get("remaining_percent") is not None]
+    any_zero = any(r.get("remaining_percent") == 0.0 for r in matched_rows)
+    valid_pcts = [r["remaining_percent"] for r in matched_rows if r.get("remaining_percent") is not None]
     if any_zero:
         remaining: float | None = 0.0
     elif valid_pcts:
@@ -378,26 +408,26 @@ def consolidate_gemini_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     else:
         remaining = None
 
-    valid_resets = [r.get("resets_at") for r in gemini_rows if r.get("resets_at")]
+    valid_resets = [r.get("resets_at") for r in matched_rows if r.get("resets_at")]
     reset = min(valid_resets) if valid_resets else None
 
-    valid_windows = [r.get("window_minutes") for r in gemini_rows if r.get("window_minutes") is not None]
+    valid_windows = [r.get("window_minutes") for r in matched_rows if r.get("window_minutes") is not None]
     window_minutes = min(valid_windows) if valid_windows else None
 
     consolidated = {
-        "name": "Gemini (共通枠)",
+        "name": label,
         "remaining_percent": remaining,
         "resets_at": reset,
         "window_minutes": window_minutes,
     }
 
     new_rows: list[dict[str, Any]] = []
-    gemini_added = False
+    added = False
     for r in rows:
-        if is_gemini_entry(r):
-            if not gemini_added:
+        if predicate(r):
+            if not added:
                 new_rows.append(consolidated)
-                gemini_added = True
+                added = True
         else:
             new_rows.append(r)
     return new_rows
@@ -444,7 +474,7 @@ def agy_usage() -> dict[str, Any]:
                     })
             if not windows:
                 raise RuntimeError("使用枠のJSONにモデル情報がありません")
-            windows = consolidate_gemini_rows(windows)
+            windows = consolidate_agy_rows(windows)
             return {"service": "agy", "ok": True, "plan": raw.get("planType"), "windows": windows}
         except Exception as exc:
             return error("agy", str(exc))
@@ -1100,7 +1130,7 @@ def table_rows(results: list[dict[str, Any]]) -> tuple[list[Any], dict[str, list
         windows = result.get("windows", [])
         if result["service"] == "agy" and "data" in result:
             windows = [{"name": n, "remaining_percent": p, "resets_at": r} for n, p, r in flatten_agy(result["data"])]
-            windows = consolidate_gemini_rows(windows)
+            windows = consolidate_agy_rows(windows)
         if not windows:
             rows.append(((result["service"], "取得済み（表示可能な枠なし）", plan, "-", "-", "-", "-", "-"), {}))
         for row in windows:
