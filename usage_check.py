@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -127,17 +128,27 @@ def codex_usage() -> dict[str, Any]:
                 proc.kill()
 
 
+def claude_keychain_service(config_dir: str | None) -> str:
+    if not config_dir:
+        return "Claude Code-credentials"
+    suffix = hashlib.sha256(unicodedata.normalize("NFC", config_dir).encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{suffix}"
+
+
 def claude_credentials() -> dict[str, Any]:
     token = os.environ.get("CLAUDE_ACCESS_TOKEN")
     if token:
         return {"accessToken": token}
-    credential_file = Path.home() / ".claude" / ".credentials.json"
+    # Follow the same account `claude` would use: CLAUDE_CONFIG_DIR switches both the
+    # credentials file location and the keychain service name (suffixed with a hash of the dir).
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    credential_file = (Path(config_dir).expanduser() if config_dir else Path.home() / ".claude") / ".credentials.json"
     if credential_file.exists():
         data = json.loads(credential_file.read_text())
         return data.get("claudeAiOauth", data)
     if sys.platform == "darwin" and shutil.which("security"):
         completed = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            ["security", "find-generic-password", "-s", claude_keychain_service(config_dir), "-w"],
             capture_output=True, text=True, timeout=5,
         )
         if completed.returncode == 0:

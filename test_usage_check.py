@@ -15,6 +15,8 @@ from usage_check import (
     pace_severity,
     percent_severity,
     capacity_text,
+    claude_credentials,
+    claude_keychain_service,
     claude_windows,
     copilot_usage,
     copilot_windows,
@@ -628,6 +630,20 @@ class ColorTests(unittest.TestCase):
         plain = re.sub(r"\033\[[0-9;]*m", "", output)
         lines = [line for line in plain.splitlines() if line.startswith(("┌", "│", "├", "└"))]
         self.assertEqual(len({display_width(line) for line in lines}), 1)
+
+    def test_claude_keychain_service_follows_config_dir(self):
+        self.assertEqual(claude_keychain_service(None), "Claude Code-credentials")
+        self.assertRegex(claude_keychain_service("/tmp/claude-alt"), r"^Claude Code-credentials-[0-9a-f]{8}$")
+
+    def test_claude_credentials_read_config_dir_file(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "t", "subscriptionType": "pro"}}))
+            with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": tmp}, clear=False):
+                os_env = __import__("os").environ
+                os_env.pop("CLAUDE_ACCESS_TOKEN", None)
+                self.assertEqual(claude_credentials()["subscriptionType"], "pro")
 
 
 if __name__ == "__main__":
