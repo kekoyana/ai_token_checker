@@ -66,6 +66,16 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("概算残量順位: claude (415pt) > codex (92pt)", output.getvalue())
         self.assertIn("8.0%", output.getvalue())
 
+    def test_print_table_includes_execution_datetime(self):
+        results = [
+            {"service": "codex", "ok": True, "plan": "plus", "windows": [{"name": "primary", "remaining_percent": 92.0}]},
+        ]
+        test_time = datetime(2026, 10, 14, 14, 30, 0).astimezone()
+        output = StringIO()
+        with redirect_stdout(output):
+            print_table(results, now=test_time)
+        self.assertIn("実行日時: 2026-10-14 14:30:00", output.getvalue())
+
     def test_claude_windows_include_model_scoped_limits(self):
         raw = {
             "five_hour": {"utilization": 16.0, "resets_at": "2026-09-02T06:29:59+00:00"},
