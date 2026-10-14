@@ -1171,7 +1171,9 @@ def table_rows(results: list[dict[str, Any]]) -> tuple[list[Any], dict[str, list
     return rows, service_scores
 
 
-def print_table(results: list[dict[str, Any]], use_color: bool | None = None) -> None:
+def print_table(results: list[dict[str, Any]], use_color: bool | None = None, now: datetime | None = None) -> None:
+    now = now or datetime.now().astimezone()
+    print(f"実行日時: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     use_color = color_enabled() if use_color is None else use_color
     rows, service_scores = table_rows(results)
     print(render_table(TABLE_HEADERS, rows, TABLE_ALIGNS, use_color))
@@ -1207,11 +1209,12 @@ def main() -> int:
         for result in results:
             if result.get("ok") and plans.get(result["service"]):
                 result["plan"] = plans[result["service"]]
+    now = datetime.now().astimezone()
     if args.json:
-        print(json.dumps({"checked_at": datetime.now().astimezone().isoformat(), "services": results}, ensure_ascii=False, indent=2))
+        print(json.dumps({"checked_at": now.isoformat(), "services": results}, ensure_ascii=False, indent=2))
     else:
         use_color = color_enabled() if args.color == "auto" else args.color == "always"
-        print_table(results, use_color)
+        print_table(results, use_color, now=now)
     return 0 if all(item["ok"] for item in results) else 1
 
 
