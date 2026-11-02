@@ -96,3 +96,23 @@ APIからプランを取得できない場合は、Git管理されない `.usage
 - OAuthトークン、APIキー、秘密鍵
 - `~/.claude/`、`~/.codex/`、`~/.gemini/`、`~/.grok/`、GitHub CLI内の認証ファイル
 - `~/Library/Application Support/antigravity-usage/` 内のファイル
+
+## ランチ検索 (`lunch_finder.py`)
+
+東劇ビル周辺の飲食店をOpenStreetMap (Overpass API) から探すCLIです。APIキーは不要です。
+
+```sh
+./lunch_finder.py                 # 半径500m以内を近い順に20件
+./lunch_finder.py ラーメン 寿司    # 店名・ジャンルで絞り込み（OR）
+./lunch_finder.py -r 800 --cafe   # 半径800m、カフェも含める
+./lunch_finder.py --at 13:30      # 今日の13:30に営業している店だけ（営業時間不明は除外、--unknownで含める）
+./lunch_finder.py --hyakumeiten   # 食べログ百名店だけ（通信不要）
+./lunch_finder.py --pick          # 候補から1軒ランダムに選ぶ
+./lunch_finder.py --json
+./lunch_finder.py -n 100 --html  # 地図付きHTML(lunch_map.html)を書き出してブラウザで開く
+```
+
+徒歩時間は分速80mの直線距離ベースです。OSMは営業時間・ジャンルが未登録の店も多く、`営業時間` は登録がある店だけ表示します。
+
+- 閉店した店はOSMに残っていることがあります（`OSM最終確認` が「なし」の店は特に要確認）。閉店を確認した店名は `lunch_closed.txt` に1行ずつ書くと除外されます。地図のポップアップには「Googleマップで営業確認」のリンクがあります。
+- ★百名店の印は `hyakumeiten.json` に登録した店（東劇ビルから900m以内の182店）だけに付きます。食べログの百名店ジャンル別ページから周辺駅の店を拾い、各店ページで住所・営業時間を確認して取り込んだものです。要約を経由した取得のため、取りこぼしや表記の誤りが残る可能性があります。選出は毎年更新されるため、手動で更新してください。
