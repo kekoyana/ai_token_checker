@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,8 @@ GROK_SUBSCRIPTIONS_URL = "https://grok.com/rest/subscriptions"
 GROK_OIDC_TOKEN_URL = "https://auth.x.ai/oauth2/token"
 GROK_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 COPILOT_USAGE_URL = "https://api.github.com/copilot_internal/user"
+AGY_DAILY_API_BASE = "https://daily-cloudcode-pa.googleapis.com"
+AGY_CLIENT_METADATA = {"ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"}
 
 # Deliberately rough, cross-service capacity points. These are comparison aids,
 # not vendor-published token or request limits.
@@ -444,7 +447,206 @@ def consolidate_shared_rows(
     return new_rows
 
 
+def agy_config_dir() -> Path:
+    """Return the configuration directory used by `antigravity-usage`."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "antigravity-usage"
+
+
+def agy_read_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def agy_load_tokens() -> dict[str, Any] | None:
+    """Load OAuth tokens for the active `antigravity-usage` account if present."""
+    config_dir = agy_config_dir()
+    config = agy_read_json(config_dir / "config.json") or {}
+    active_email = config.get("activeAccount")
+    if isinstance(active_email, str) and active_email.strip():
+        safe_name = re.sub(r"[^a-zA-Z0-9@._-]", "_", active_email.strip())
+        tokens = agy_read_json(config_dir / "accounts" / safe_name / "tokens.json")
+        if tokens:
+            return tokens
+    return agy_read_json(config_dir / "tokens.json")
+
+
+def agy_token_expired(tokens: dict[str, Any], skew_seconds: int = 300) -> bool:
+    expires_at = tokens.get("expiresAt")
+    if expires_at is None:
+        return False
+    try:
+        expires_ms = float(expires_at)
+    except (TypeError, ValueError):
+        return False
+    return time.time() * 1000.0 >= expires_ms - skew_seconds * 1000.0
+
+
+def agy_refresh_tokens_cli() -> None:
+    command = shutil.which("antigravity-usage")
+    if not command:
+        raise RuntimeError("antigravity-usageのトークン更新に失敗しました（antigravity-usageが見つかりません）")
+    completed = subprocess.run([command, "accounts", "refresh"], capture_output=True, text=True, timeout=TIMEOUT)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "トークンの更新に失敗しました"
+        raise RuntimeError(detail)
+
+
+def agy_request_json(endpoint: str, token: str, body: dict[str, Any]) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{AGY_DAILY_API_BASE}{endpoint}",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "antigravity",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        raw = json.load(response)
+    if not isinstance(raw, dict):
+        raise RuntimeError("Antigravity APIの応答形式が不正です")
+    return raw
+
+
+def agy_extract_project_id(code_assist: dict[str, Any], fallback: Any = None) -> str | None:
+    project = code_assist.get("cloudaicompanionProject")
+    if isinstance(project, str) and project:
+        return project
+    if isinstance(project, dict):
+        project_id = project.get("id")
+        if isinstance(project_id, str) and project_id:
+            return project_id
+    return str(fallback) if isinstance(fallback, str) and fallback else None
+
+
+def agy_extract_plan(code_assist: dict[str, Any]) -> str | None:
+    paid_tier = code_assist.get("paidTier") if isinstance(code_assist.get("paidTier"), dict) else {}
+    current_tier = code_assist.get("currentTier") if isinstance(code_assist.get("currentTier"), dict) else {}
+    plan_info = code_assist.get("planInfo") if isinstance(code_assist.get("planInfo"), dict) else {}
+    for value in (
+        paid_tier.get("name"),
+        paid_tier.get("id"),
+        plan_info.get("planType"),
+        current_tier.get("name"),
+        current_tier.get("id"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def agy_should_include_model(model_id: str, model_info: dict[str, Any]) -> bool:
+    if model_id.startswith(("chat_", "tab_", "rev")):
+        return False
+    if "image" in model_id or "mquery" in model_id or "lite" in model_id:
+        return False
+    return isinstance(model_info.get("quotaInfo"), dict)
+
+
+def agy_time_until_reset_ms(reset_time: Any, now: datetime | None = None) -> float | None:
+    reset_dt = parse_reset_datetime(reset_time)
+    if reset_dt is None:
+        return None
+    current = now or datetime.now().astimezone()
+    diff_ms = (reset_dt - current).total_seconds() * 1000.0
+    return diff_ms if diff_ms > 0 else None
+
+
+def agy_build_windows(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    windows: list[dict[str, Any]] = []
+    seen_windows: set[tuple[str, Any, Any]] = set()
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        raw_remaining = model.get("remainingPercentage")
+        reset = model.get("resetTime")
+        time_until_reset_ms = model.get("timeUntilResetMs")
+        if raw_remaining is None and reset is None:
+            continue
+        if model.get("isExhausted"):
+            remaining: float | None = 0.0
+        elif raw_remaining is None:
+            # Gemini系はremainingPercentageを返さない場合がある。枠の存在とリセット時刻だけ載せる。
+            remaining = None
+        else:
+            remaining = max(0.0, min(100.0, float(raw_remaining) * 100.0))
+        name = model.get("label") or model.get("modelId") or model.get("id") or "model"
+        identity = (str(name), remaining, reset)
+        if identity not in seen_windows:
+            seen_windows.add(identity)
+            window_minutes = agy_infer_window_minutes(time_until_reset_ms, remaining)
+            windows.append({
+                "name": name,
+                "remaining_percent": remaining,
+                "resets_at": reset,
+                "window_minutes": window_minutes,
+            })
+    if not windows:
+        raise RuntimeError("使用枠のJSONにモデル情報がありません")
+    return consolidate_agy_rows(windows)
+
+
+def agy_usage_from_api(tokens_info: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    token = tokens_info.get("accessToken")
+    if (not token or agy_token_expired(tokens_info)) and tokens_info.get("refreshToken"):
+        agy_refresh_tokens_cli()
+        refreshed = agy_load_tokens()
+        if refreshed:
+            tokens_info = refreshed
+        token = tokens_info.get("accessToken")
+    if not token:
+        raise RuntimeError("Antigravityのアクセストークンがありません（antigravity-usage loginを実行してください）")
+
+    code_assist = agy_request_json("/v1internal:loadCodeAssist", str(token), {"metadata": AGY_CLIENT_METADATA})
+    project_id = agy_extract_project_id(code_assist, fallback=tokens_info.get("projectId"))
+    models_body = {"project": project_id} if project_id else {}
+    models_resp = agy_request_json("/v1internal:fetchAvailableModels", str(token), models_body)
+    models_map = models_resp.get("models") if isinstance(models_resp.get("models"), dict) else {}
+
+    normalized: list[dict[str, Any]] = []
+    for model_id, info in models_map.items():
+        if not isinstance(info, dict) or not agy_should_include_model(str(model_id), info):
+            continue
+        quota = info["quotaInfo"]
+        reset_time = quota.get("resetTime")
+        remaining_fraction = quota.get("remainingFraction")
+        normalized.append({
+            "modelId": model_id,
+            "label": info.get("displayName") or model_id,
+            "remainingPercentage": remaining_fraction,
+            "isExhausted": quota.get("isExhausted") or (remaining_fraction == 0),
+            "resetTime": reset_time,
+            "timeUntilResetMs": agy_time_until_reset_ms(reset_time, now=now),
+        })
+
+    windows = agy_build_windows(normalized)
+    return {"service": "agy", "ok": True, "plan": agy_extract_plan(code_assist), "windows": windows}
+
+
 def agy_usage() -> dict[str, Any]:
+    tokens_info = agy_load_tokens()
+    if tokens_info is not None:
+        try:
+            return agy_usage_from_api(tokens_info)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return error("agy", "Antigravityの認証が切れています（antigravity-usage loginを実行してください）")
+            return error("agy", f"APIエラー HTTP {exc.code}")
+        except Exception as exc:
+            return error("agy", str(exc))
+
     modern_command = shutil.which("antigravity-usage")
     if modern_command:
         try:
@@ -455,37 +657,7 @@ def agy_usage() -> dict[str, Any]:
                 raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "使用量の取得に失敗しました")
             raw = json.loads(completed.stdout)
             models = raw.get("models", []) if isinstance(raw, dict) else []
-            windows = []
-            seen_windows: set[tuple[str, Any, Any]] = set()
-            for model in models:
-                if not isinstance(model, dict):
-                    continue
-                raw_remaining = model.get("remainingPercentage")
-                reset = model.get("resetTime")
-                time_until_reset_ms = model.get("timeUntilResetMs")
-                if raw_remaining is None and reset is None:
-                    continue
-                if model.get("isExhausted"):
-                    remaining = 0.0
-                elif raw_remaining is None:
-                    # Gemini系はremainingPercentageを返さない場合がある。枠の存在とリセット時刻だけ載せる。
-                    remaining = None
-                else:
-                    remaining = max(0.0, min(100.0, float(raw_remaining) * 100.0))
-                name = model.get("label") or model.get("modelId") or model.get("id") or "model"
-                identity = (str(name), remaining, reset)
-                if identity not in seen_windows:
-                    seen_windows.add(identity)
-                    window_minutes = agy_infer_window_minutes(time_until_reset_ms, remaining)
-                    windows.append({
-                        "name": name,
-                        "remaining_percent": remaining,
-                        "resets_at": reset,
-                        "window_minutes": window_minutes,
-                    })
-            if not windows:
-                raise RuntimeError("使用枠のJSONにモデル情報がありません")
-            windows = consolidate_agy_rows(windows)
+            windows = agy_build_windows(models)
             return {"service": "agy", "ok": True, "plan": raw.get("planType"), "windows": windows}
         except Exception as exc:
             return error("agy", str(exc))

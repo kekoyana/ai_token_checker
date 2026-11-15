@@ -56,7 +56,7 @@ ai-usage
 - GitHub Copilot: GitHub CLIの認証を使い、GitHubの内部利用枠APIから月次のAI Credits（旧課金方式ではPremium requests）、Chat、Completionsを取得
   - AI Credits方式では小数付き残量を優先し、割合は小数2桁、`EST. LEFT` は実残量 / 月次枠（`cr`）を表示します。Pro+はAPIの契約SKUで判別します。
   - 無制限の枠は表示せず、上限がある枠だけを表示します。このAPIは非公開仕様のため、GitHub側の変更で利用できなくなる可能性があります。
-- agy: `antigravity-usage quota --json`（Antigravity IDEへのローカル接続、または補助CLI独自のOAuth認証）
+- agy: `antigravity-usage login` で保存された OAuth トークンを使い、`daily-cloudcode-pa.googleapis.com` の Cloud Code API（`loadCodeAssist` / `fetchAvailableModels`）を直接参照（トークン未保存時は `antigravity-usage quota --json` へフォールバック）
   - Gemini系モデルはすべて同一のクォータ枠（共通プール）を共有するため、「Gemini (共通枠)」として1行に集約して表示します（Gemini 3.8 Flashなど新モデルが追加されても自動で集約されます）。残量APIが数値を返さない場合はREMAINは「不明」となります。
 - Grok: Grok Build CLIのOAuth認証（`~/.grok/auth.json`）で課金APIと契約APIを参照。アクセストークンが期限切れならリフレッシュトークンで自動更新します（更新後のトークンはメモリ上のみで、ファイルへは書き戻しません）
 

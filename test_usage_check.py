@@ -1,15 +1,20 @@
 import json
 import re
+import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from usage_check import (
+    AGY_DAILY_API_BASE,
     ANSI_RESET,
     COPILOT_USAGE_URL,
     GROK_SUBSCRIPTIONS_URL,
+    agy_load_tokens,
     agy_usage,
     display_width,
     pace_severity,
@@ -130,9 +135,10 @@ class FormattingTests(unittest.TestCase):
 
 
 class AgyUsageTests(unittest.TestCase):
+    @patch("usage_check.agy_load_tokens", return_value=None)
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", side_effect=[None, "/usr/local/bin/agy-usage"])
-    def test_legacy_quota_summary_error_is_reported(self, _which, run):
+    def test_legacy_quota_summary_error_is_reported(self, _which, run, _tokens):
         run.return_value.returncode = 0
         run.return_value.stdout = '{"quota_summary_error":"No Antigravity OAuth token"}'
         run.return_value.stderr = ""
@@ -143,9 +149,10 @@ class AgyUsageTests(unittest.TestCase):
         self.assertEqual(result["service"], "agy")
         self.assertIn("No Antigravity OAuth token", result["error"])
 
+    @patch("usage_check.agy_load_tokens", return_value=None)
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
-    def test_modern_cli_models_are_converted_to_percent(self, _which, run):
+    def test_modern_cli_models_are_converted_to_percent(self, _which, run, _tokens):
         run.return_value.returncode = 0
         run.return_value.stdout = json.dumps({
             "models": [{
@@ -163,9 +170,10 @@ class AgyUsageTests(unittest.TestCase):
         self.assertEqual(result["windows"][0]["remaining_percent"], 62.5)
         self.assertEqual(result["windows"][0]["name"], "Gemini (共通枠)")
 
+    @patch("usage_check.agy_load_tokens", return_value=None)
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
-    def test_identical_model_windows_are_deduplicated(self, _which, run):
+    def test_identical_model_windows_are_deduplicated(self, _which, run, _tokens):
         model = {
             "label": "Gemini 3.1 Pro (High)",
             "remainingPercentage": 0.999,
@@ -180,9 +188,10 @@ class AgyUsageTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["windows"]), 1)
 
+    @patch("usage_check.agy_load_tokens", return_value=None)
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
-    def test_models_without_remaining_percentage_are_kept(self, _which, run):
+    def test_models_without_remaining_percentage_are_kept(self, _which, run, _tokens):
         """Gemini系はremainingPercentageを返さない場合がある。枠ごと消えると枯渇に気付けない。"""
         run.return_value.returncode = 0
         run.return_value.stdout = json.dumps({
@@ -204,9 +213,10 @@ class AgyUsageTests(unittest.TestCase):
         # 5hウィンドウ前提のペース計算を62hの枠に適用しない
         self.assertIsNone(gemini["window_minutes"])
 
+    @patch("usage_check.agy_load_tokens", return_value=None)
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
-    def test_exhausted_model_is_zero_percent(self, _which, run):
+    def test_exhausted_model_is_zero_percent(self, _which, run, _tokens):
         run.return_value.returncode = 0
         run.return_value.stdout = json.dumps({
             "models": [{"label": "Gemini 3.7 Flash", "isExhausted": True, "resetTime": "2026-09-02T03:40:23Z"}]
@@ -218,9 +228,10 @@ class AgyUsageTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["windows"][0]["remaining_percent"], 0.0)
 
+    @patch("usage_check.agy_load_tokens", return_value=None)
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
-    def test_model_without_quota_or_reset_is_skipped(self, _which, run):
+    def test_model_without_quota_or_reset_is_skipped(self, _which, run, _tokens):
         run.return_value.returncode = 0
         run.return_value.stdout = json.dumps({
             "models": [
@@ -235,9 +246,10 @@ class AgyUsageTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual([w["name"] for w in result["windows"]], ["Gemini (共通枠)"])
 
+    @patch("usage_check.agy_load_tokens", return_value=None)
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
-    def test_multiple_gemini_models_are_consolidated(self, _which, run):
+    def test_multiple_gemini_models_are_consolidated(self, _which, run, _tokens):
         run.return_value.returncode = 0
         run.return_value.stdout = json.dumps({
             "models": [
@@ -263,6 +275,90 @@ class AgyUsageTests(unittest.TestCase):
         self.assertEqual(windows[1]["remaining_percent"], 95.0)
         self.assertEqual(windows[1]["resets_at"], "2026-09-03T06:41:42Z")
         self.assertEqual(windows[2]["name"], "GPT-OSS 120B (Medium)")
+
+    def test_load_tokens_reads_active_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps({"activeAccount": "user@example.com"}))
+            acct_dir = root / "accounts" / "user@example.com"
+            acct_dir.mkdir(parents=True)
+            (acct_dir / "tokens.json").write_text(json.dumps({"accessToken": "tok-1", "projectId": "proj-1"}))
+            with patch("usage_check.agy_config_dir", return_value=root):
+                tokens = agy_load_tokens()
+        self.assertEqual(tokens, {"accessToken": "tok-1", "projectId": "proj-1"})
+
+    @patch("usage_check.urllib.request.urlopen")
+    @patch("usage_check.agy_load_tokens")
+    def test_daily_api_usage_reports_plan_and_consolidated_windows(self, load_tokens, urlopen):
+        future_ms = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000)
+        load_tokens.return_value = {"accessToken": "tok-live", "expiresAt": future_ms}
+
+        def fake_urlopen(request, timeout=None):
+            resp = unittest.mock.MagicMock()
+            if request.full_url == f"{AGY_DAILY_API_BASE}/v1internal:loadCodeAssist":
+                payload = {
+                    "cloudaicompanionProject": "aicode-consumers",
+                    "currentTier": {"id": "free-tier", "name": "Antigravity"},
+                    "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro"},
+                }
+            elif request.full_url == f"{AGY_DAILY_API_BASE}/v1internal:fetchAvailableModels":
+                self.assertEqual(json.loads(request.data.decode()), {"project": "aicode-consumers"})
+                payload = {
+                    "models": {
+                        "chat_20706": {"quotaInfo": {"remainingFraction": 1}},
+                        "gemini-3.5-flash-lite": {"displayName": "Gemini 3.5 Flash Lite", "quotaInfo": {"remainingFraction": 0.2, "resetTime": "2026-11-15T08:39:14Z"}},
+                        "gemini-3.8-flash-tiered": {"quotaInfo": {"remainingFraction": 0.25, "resetTime": "2026-11-15T08:39:14Z"}},
+                        "gemini-3-flash": {"displayName": "Gemini 3 Flash", "quotaInfo": {"remainingFraction": 0.25, "resetTime": "2026-11-15T08:39:14Z"}},
+                        "claude-sonnet-5-5-high": {"displayName": "Claude Sonnet 5.5 (High)", "quotaInfo": {"remainingFraction": 1, "resetTime": "2026-11-15T10:30:00Z"}},
+                    }
+                }
+            else:
+                raise AssertionError(f"Unexpected URL: {request.full_url}")
+            resp.__enter__.return_value = StringIO(json.dumps(payload))
+            return resp
+
+        urlopen.side_effect = fake_urlopen
+        result = agy_usage()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["plan"], "Google AI Pro")
+        self.assertEqual(capacity_text("agy", result["plan"]), "AI Pro")
+        names = [w["name"] for w in result["windows"]]
+        self.assertEqual(names, ["Gemini (共通枠)", "Claude (共通枠)"])
+        self.assertEqual(result["windows"][0]["remaining_percent"], 25.0)
+        self.assertEqual(result["windows"][1]["remaining_percent"], 100.0)
+
+    @patch("usage_check.agy_request_json")
+    @patch("usage_check.agy_refresh_tokens_cli")
+    @patch("usage_check.agy_load_tokens")
+    def test_expired_token_triggers_cli_refresh_before_api_call(self, load_tokens, refresh_cli, request_json):
+        expired_ms = int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp() * 1000)
+        fresh_ms = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000)
+        load_tokens.side_effect = [
+            {"accessToken": "old-tok", "refreshToken": "ref-tok", "expiresAt": expired_ms},
+            {"accessToken": "new-tok", "refreshToken": "ref-tok", "expiresAt": fresh_ms},
+        ]
+        request_json.side_effect = [
+            {"cloudaicompanionProject": "proj-1", "paidTier": {"name": "Google AI Pro"}},
+            {"models": {"gemini-3-flash": {"displayName": "Gemini 3 Flash", "quotaInfo": {"remainingFraction": 0.5, "resetTime": "2026-11-15T08:39:14Z"}}}},
+        ]
+
+        result = agy_usage()
+
+        refresh_cli.assert_called_once()
+        self.assertTrue(result["ok"])
+        self.assertEqual(request_json.call_args_list[0].args[1], "new-tok")
+
+    @patch("usage_check.agy_request_json", side_effect=urllib.error.HTTPError("https://example.com", 401, "Unauthorized", {}, None))
+    @patch("usage_check.agy_load_tokens")
+    def test_daily_api_auth_error_returns_relogin_guidance(self, load_tokens, _request):
+        future_ms = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000)
+        load_tokens.return_value = {"accessToken": "tok", "expiresAt": future_ms}
+
+        result = agy_usage()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("antigravity-usage login", result["error"])
 
     def test_print_table_renders_unknown_remaining(self):
         """None行でTypeErrorを出さず、リセット時刻を見せる。"""
