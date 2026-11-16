@@ -15,8 +15,13 @@ from usage_check import (
     COPILOT_USAGE_URL,
     GROK_SUBSCRIPTIONS_URL,
     agy_build_windows,
+    agy_discover_accounts,
     agy_load_tokens,
+    agy_parse_oauth_token_file,
+    agy_refresh_native_token,
+    agy_token_expired,
     agy_usage,
+    agy_usages,
     display_width,
     pace_severity,
     percent_severity,
@@ -35,6 +40,7 @@ from usage_check import (
     pace_text,
     print_table,
     reset_text,
+    table_rows,
 )
 
 
@@ -56,6 +62,7 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(capacity_text("claude", "pro"), "Pro 1x")
         self.assertEqual(capacity_text("agy", "ultra"), "Ultra (倍率不明)")
         self.assertEqual(capacity_text("agy", "AI Pro"), "AI Pro")
+        self.assertEqual(capacity_text("agy", "Antigravity Starter Quota"), "Starter")
         self.assertEqual(capacity_text("codex", "plus"), "Plus")
         self.assertEqual(capacity_text("codex", None), "不明")
         self.assertEqual(capacity_text("grok", "supergrok_heavy"), "SuperGrok Heavy")
@@ -294,9 +301,64 @@ class AgyUsageTests(unittest.TestCase):
             acct_dir = root / "accounts" / "user@example.com"
             acct_dir.mkdir(parents=True)
             (acct_dir / "tokens.json").write_text(json.dumps({"accessToken": "tok-1", "projectId": "proj-1"}))
-            with patch("usage_check.agy_config_dir", return_value=root):
+            with patch.dict("os.environ", {"ANTIGRAVITY_APP_DATA_DIR": ""}, clear=False), \
+                 patch("usage_check.agy_oauth_token_paths", return_value=[]), \
+                 patch("usage_check.agy_config_dir", return_value=root):
                 tokens = agy_load_tokens()
-        self.assertEqual(tokens, {"accessToken": "tok-1", "projectId": "proj-1"})
+        self.assertEqual(tokens["accessToken"], "tok-1")
+        self.assertEqual(tokens["projectId"], "proj-1")
+
+    def test_parse_oauth_token_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "antigravity-oauth-token"
+            p.write_text(json.dumps({
+                "token": {
+                    "access_token": "ya29.test-tok",
+                    "refresh_token": "1//ref-test",
+                    "expiry": "2026-11-17T00:30:00+09:00",
+                },
+                "id_token_email": "sub@example.com",
+            }))
+            tokens = agy_parse_oauth_token_file(p)
+            self.assertIsNotNone(tokens)
+            self.assertEqual(tokens["accessToken"], "ya29.test-tok")
+            self.assertEqual(tokens["refreshToken"], "1//ref-test")
+            self.assertEqual(tokens["email"], "sub@example.com")
+            self.assertIsNotNone(tokens["expiresAt"])
+
+    def test_load_tokens_finds_antigravity_oauth_token_in_app_data_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp) / "antigravity-cli"
+            app_dir.mkdir()
+            (app_dir / "antigravity-oauth-token").write_text(json.dumps({
+                "token": {"access_token": "tok-app-data"},
+                "id_token_email": "sub@example.com",
+            }))
+            with patch.dict("os.environ", {"ANTIGRAVITY_APP_DATA_DIR": str(app_dir)}):
+                tokens = agy_load_tokens()
+            self.assertEqual(tokens["accessToken"], "tok-app-data")
+            self.assertEqual(tokens["email"], "sub@example.com")
+
+    def test_load_tokens_finds_account_specific_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            acct_cli_dir = root / ".agy-accounts" / "sub" / ".gemini" / "antigravity-cli"
+            acct_cli_dir.mkdir(parents=True)
+            (acct_cli_dir / "antigravity-oauth-token").write_text(json.dumps({
+                "token": {"access_token": "tok-sub"},
+                "id_token_email": "sub@example.com",
+            }))
+            with patch.dict("os.environ", {"ANTIGRAVITY_APP_DATA_DIR": ""}, clear=False), \
+                 patch("pathlib.Path.home", return_value=root):
+                tokens = agy_load_tokens(account="sub")
+            self.assertEqual(tokens["accessToken"], "tok-sub")
+            self.assertEqual(tokens["email"], "sub@example.com")
+
+    def test_token_expired_with_iso_string_or_timestamp(self):
+        future_iso = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        past_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        self.assertFalse(agy_token_expired({"expiresAt": future_iso}))
+        self.assertTrue(agy_token_expired({"expiresAt": past_iso}))
 
     @patch("usage_check.urllib.request.urlopen")
     @patch("usage_check.agy_load_tokens")
@@ -370,6 +432,105 @@ class AgyUsageTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("antigravity-usage login", result["error"])
+
+    def test_discover_accounts_collects_primary_and_alt_accounts_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            usage_dir = base / "Library" / "Application Support" / "antigravity-usage"
+            acct_usage = usage_dir / "accounts" / "primary@example.com"
+            acct_usage.mkdir(parents=True)
+            (usage_dir / "config.json").write_text(json.dumps({"activeAccount": "primary@example.com"}))
+            (acct_usage / "tokens.json").write_text(json.dumps({"accessToken": "tok-main", "email": "primary@example.com"}))
+
+            alt_cli = base / ".agy-accounts" / "sub" / ".gemini" / "antigravity-cli"
+            alt_cli.mkdir(parents=True)
+            (alt_cli / "antigravity-oauth-token").write_text(json.dumps({
+                "token": {"access_token": "tok-alt", "refresh_token": "ref-alt"},
+                "id_token_email": "sub@example.com",
+            }))
+
+            with patch("pathlib.Path.home", return_value=base / ".agy-accounts" / "sub"), \
+                 patch("sys.platform", "darwin"):
+                accounts = agy_discover_accounts()
+
+        self.assertEqual([label for label, _ in accounts], ["primary", "sub"])
+        self.assertEqual(accounts[0][1]["accessToken"], "tok-main")
+        self.assertEqual(accounts[1][1]["accessToken"], "tok-alt")
+
+    @patch("usage_check.agy_usage_from_api")
+    @patch("usage_check.agy_discover_accounts")
+    def test_agy_usages_returns_all_accounts_and_isolates_errors(self, discover, usage_from_api):
+        discover.return_value = [
+            ("primary", {"accessToken": "t1", "accountLabel": "primary"}),
+            ("sub", {"accessToken": "t2", "accountLabel": "sub"}),
+        ]
+        usage_from_api.side_effect = [
+            {"service": "agy", "account": "primary", "ok": True, "plan": "Google AI Pro", "windows": []},
+            RuntimeError("token expired"),
+        ]
+
+        with patch.dict("os.environ", {"AGY_ACCOUNT": ""}, clear=False):
+            results = agy_usages()
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(results[0]["ok"])
+        self.assertEqual(results[0]["account"], "primary")
+        self.assertFalse(results[1]["ok"])
+        self.assertEqual(results[1]["account"], "sub")
+        self.assertIn("token expired", results[1]["error"])
+
+    def test_table_rows_labels_multiple_agy_accounts_and_keeps_capacity_lookup(self):
+        results = [
+            {
+                "service": "agy",
+                "account": "primary",
+                "ok": True,
+                "plan": "Google AI Pro",
+                "windows": [{"name": "Claude (共通枠)", "remaining_percent": 100.0}],
+            },
+            {
+                "service": "agy",
+                "account": "sub",
+                "ok": True,
+                "plan": "Antigravity Starter Quota",
+                "windows": [{"name": "Claude (共通枠)", "remaining_percent": 60.0}],
+            },
+        ]
+        output = StringIO()
+        with redirect_stdout(output):
+            print_table(results, use_color=False)
+        text = output.getvalue()
+        self.assertIn("agy (primary)", text)
+        self.assertIn("agy (sub)", text)
+        self.assertIn("AI Pro", text)
+        self.assertIn("Starter", text)
+        self.assertIn("約30pt (少)", text)
+        self.assertIn("概算残量順位: agy (primary) (100pt) > agy (sub) (30pt)", text)
+
+    def test_refresh_native_token_uses_ephemeral_cli_home_when_env_not_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict("os.environ", {"ANTIGRAVITY_OAUTH_CLIENT_ID": "", "ANTIGRAVITY_OAUTH_CLIENT_SECRET": ""}, clear=False), \
+                 patch("usage_check.shutil.which", side_effect=lambda cmd: "/usr/local/bin/antigravity-usage" if cmd == "antigravity-usage" else None), \
+                 patch("usage_check.agy_config_dir", side_effect=lambda home=None: (home or root) / "antigravity-usage") as _cfg:
+                def fake_refresh(home=None):
+                    acct_tokens = (home / "antigravity-usage" / "accounts" / "sub@example.com" / "tokens.json")
+                    acct_tokens.write_text(json.dumps({
+                        "accessToken": "refreshed-tok",
+                        "refreshToken": "ref-2",
+                        "expiresAt": 9999999999000,
+                    }))
+
+                with patch("usage_check.agy_refresh_tokens_cli", side_effect=fake_refresh):
+                    refreshed = agy_refresh_native_token({
+                        "accessToken": "old-tok",
+                        "refreshToken": "ref-1",
+                        "email": "sub@example.com",
+                        "tokenKind": "native",
+                    })
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed["accessToken"], "refreshed-tok")
+        self.assertEqual(refreshed["refreshToken"], "ref-2")
 
     def test_print_table_renders_unknown_remaining(self):
         """None行でTypeErrorを出さず、リセット時刻を見せる。"""

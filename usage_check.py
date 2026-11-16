@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -39,7 +40,7 @@ CAPACITY_POINTS = {
     "codex": {"free": 20, "go": 50, "plus": 100, "pro": 1000, "business": 250, "enterprise": 1000, "edu": 250},
     "claude": {"free": 20, "pro": 100, "max_5x": 500, "max_20x": 2000, "team": 500, "enterprise": 1000},
     "copilot": {"free": 20, "pro": 100, "business": 250, "enterprise": 1000},
-    "agy": {"free": 20, "ai_pro": 100, "pro": 100, "ultra_5x": 500, "ultra_20x": 2000, "enterprise": 1000},
+    "agy": {"free": 20, "starter": 50, "plus": 50, "ai_pro": 100, "pro": 100, "ultra_5x": 500, "ultra_20x": 2000, "enterprise": 1000},
     "grok": {
         "free": 20,
         "x_basic": 20,
@@ -451,15 +452,25 @@ def consolidate_shared_rows(
     return new_rows
 
 
-def agy_config_dir() -> Path:
+def agy_config_dir(home: Path | None = None) -> Path:
     """Return the configuration directory used by `antigravity-usage`."""
+    target_home = home or Path.home()
     if sys.platform == "win32":
-        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        base = Path(os.environ.get("APPDATA") or target_home / "AppData" / "Roaming")
     elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support"
+        base = target_home / "Library" / "Application Support"
     else:
-        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        xdg = os.environ.get("XDG_CONFIG_HOME") if home is None else None
+        base = Path(xdg) if xdg else target_home / ".config"
     return base / "antigravity-usage"
+
+
+def agy_base_home(home: Path | None = None) -> Path:
+    """Return the user's primary home even when invoked inside `~/.agy-accounts/<name>`."""
+    current = home or Path.home()
+    if current.parent.name == ".agy-accounts":
+        return current.parent.parent
+    return current
 
 
 def agy_read_json(path: Path) -> dict[str, Any] | None:
@@ -472,38 +483,284 @@ def agy_read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def agy_load_tokens() -> dict[str, Any] | None:
-    """Load OAuth tokens for the active `antigravity-usage` account if present."""
-    config_dir = agy_config_dir()
+def agy_parse_oauth_token_file(path: Path) -> dict[str, Any] | None:
+    """Parse Antigravity CLI's native `antigravity-oauth-token` file into standard tokens format."""
+    data = agy_read_json(path)
+    if not isinstance(data, dict):
+        return None
+    token_obj = data.get("token")
+    if not isinstance(token_obj, dict):
+        return None
+    access_token = token_obj.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        return None
+
+    expires_at = None
+    raw_expiry = token_obj.get("expiry")
+    if raw_expiry:
+        dt = parse_reset_datetime(raw_expiry)
+        if dt is not None:
+            expires_at = dt.timestamp() * 1000.0
+
+    return {
+        "accessToken": access_token.strip(),
+        "refreshToken": token_obj.get("refresh_token"),
+        "expiresAt": expires_at,
+        "email": data.get("id_token_email"),
+        "source": str(path),
+        "tokenKind": "native",
+    }
+
+
+def agy_load_usage_cli_tokens(account: str | None = None, home: Path | None = None) -> dict[str, Any] | None:
+    """Load OAuth tokens stored by `antigravity-usage`."""
+    config_dir = agy_config_dir(home=home)
+    if account:
+        safe_name = re.sub(r"[^a-zA-Z0-9@._-]", "_", account.strip())
+        tokens = agy_read_json(config_dir / "accounts" / safe_name / "tokens.json")
+        if tokens:
+            return {**tokens, "source": str(config_dir / "accounts" / safe_name / "tokens.json"), "tokenKind": "antigravity-usage"}
+
     config = agy_read_json(config_dir / "config.json") or {}
     active_email = config.get("activeAccount")
     if isinstance(active_email, str) and active_email.strip():
         safe_name = re.sub(r"[^a-zA-Z0-9@._-]", "_", active_email.strip())
         tokens = agy_read_json(config_dir / "accounts" / safe_name / "tokens.json")
         if tokens:
+            return {**tokens, "source": str(config_dir / "accounts" / safe_name / "tokens.json"), "tokenKind": "antigravity-usage"}
+    legacy_path = config_dir / "tokens.json"
+    tokens = agy_read_json(legacy_path)
+    if tokens:
+        return {**tokens, "source": str(legacy_path), "tokenKind": "antigravity-usage"}
+    return None
+
+
+def agy_oauth_token_paths(account: str | None = None) -> list[Path]:
+    """Return search paths for official `antigravity-oauth-token` files in priority order."""
+    paths: list[Path] = []
+    env_app_dir = os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
+    if env_app_dir and not account:
+        paths.append(Path(env_app_dir) / "antigravity-oauth-token")
+
+    home = Path.home()
+    base_home = agy_base_home(home)
+    root_homes = [base_home] if base_home == home else [home, base_home]
+
+    if account:
+        safe_account = re.sub(r"[^a-zA-Z0-9@._-]", "_", account.strip())
+        for r_home in root_homes:
+            paths.append(r_home / ".agy-accounts" / safe_account / ".gemini" / "antigravity-cli" / "antigravity-oauth-token")
+            paths.append(r_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token")
+    else:
+        for r_home in root_homes:
+            paths.append(r_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token")
+        accounts_dir = base_home / ".agy-accounts"
+        if accounts_dir.is_dir():
+            try:
+                for child in sorted(accounts_dir.iterdir()):
+                    if child.is_dir():
+                        paths.append(child / ".gemini" / "antigravity-cli" / "antigravity-oauth-token")
+            except OSError:
+                pass
+
+    seen: set[Path] = set()
+    unique_paths: list[Path] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            unique_paths.append(p)
+    return unique_paths
+
+
+def resolve_agy_account(cli_account: str | None = None) -> str | None:
+    """Resolve active agy account name from CLI args, environment, or local config."""
+    if cli_account and cli_account.strip():
+        return cli_account.strip()
+    env_acct = os.environ.get("AGY_ACCOUNT")
+    if env_acct and env_acct.strip():
+        return env_acct.strip()
+    local_cfg = load_local_config()
+    cfg_acct = local_cfg.get("agy_account")
+    if not cfg_acct and isinstance(local_cfg.get("accounts"), dict):
+        cfg_acct = local_cfg["accounts"].get("agy")
+    if isinstance(cfg_acct, str) and cfg_acct.strip():
+        return cfg_acct.strip()
+    return None
+
+
+def agy_account_label(tokens: dict[str, Any], preferred: str | None = None) -> str:
+    if preferred:
+        return preferred
+    email = tokens.get("email")
+    if isinstance(email, str) and email.strip():
+        return email.strip().split("@")[0]
+    return "main"
+
+
+def agy_load_tokens(account: str | None = None) -> dict[str, Any] | None:
+    """Load OAuth tokens for a single Antigravity account."""
+    home = Path.home()
+    base_home = agy_base_home(home)
+    if account:
+        alt_home = base_home / ".agy-accounts" / account.strip()
+        native = agy_parse_oauth_token_file(alt_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token")
+        if native:
+            return {**native, "accountHome": str(alt_home), "accountLabel": account.strip()}
+        cli_tokens = agy_load_usage_cli_tokens(home=alt_home) or agy_load_usage_cli_tokens(account=account, home=base_home)
+        if cli_tokens:
+            return {**cli_tokens, "accountHome": str(alt_home if alt_home.is_dir() else base_home), "accountLabel": account.strip()}
+        return None
+
+    for token_path in agy_oauth_token_paths():
+        tokens = agy_parse_oauth_token_file(token_path)
+        if tokens:
             return tokens
-    return agy_read_json(config_dir / "tokens.json")
+
+    return agy_load_usage_cli_tokens(home=base_home)
+
+
+def agy_discover_accounts() -> list[tuple[str, dict[str, Any]]]:
+    """Discover the primary Antigravity account plus all `~/.agy-accounts/*` accounts."""
+    base_home = agy_base_home()
+    discovered: list[tuple[str, dict[str, Any]]] = []
+    seen_emails: set[str] = set()
+    seen_sources: set[str] = set()
+
+    def add_candidate(tokens: dict[str, Any] | None, account_home: Path, preferred_label: str | None = None) -> None:
+        if not tokens:
+            return
+        source = str(tokens.get("source") or "")
+        email = str(tokens.get("email") or "").strip().lower()
+        if (source and source in seen_sources) or (email and email in seen_emails):
+            return
+        if source:
+            seen_sources.add(source)
+        if email:
+            seen_emails.add(email)
+        label = agy_account_label(tokens, preferred=preferred_label)
+        enriched = {**tokens, "accountHome": str(account_home), "accountLabel": label}
+        discovered.append((label, enriched))
+
+    # 1. Primary home account (native token if present, otherwise antigravity-usage)
+    primary_native = agy_parse_oauth_token_file(base_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token")
+    primary_cli = agy_load_usage_cli_tokens(home=base_home)
+    add_candidate(primary_native or primary_cli, base_home)
+
+    # 2. Additional accounts under ~/.agy-accounts/<name>
+    accounts_dir = base_home / ".agy-accounts"
+    if accounts_dir.is_dir():
+        try:
+            children = sorted(child for child in accounts_dir.iterdir() if child.is_dir())
+        except OSError:
+            children = []
+        for child in children:
+            native = agy_parse_oauth_token_file(child / ".gemini" / "antigravity-cli" / "antigravity-oauth-token")
+            cli_tokens = agy_load_usage_cli_tokens(home=child)
+            add_candidate(native or cli_tokens, child, preferred_label=child.name)
+
+    return discovered
 
 
 def agy_token_expired(tokens: dict[str, Any], skew_seconds: int = 300) -> bool:
     expires_at = tokens.get("expiresAt")
     if expires_at is None:
         return False
-    try:
+    expires_ms: float | None = None
+    if isinstance(expires_at, (int, float)):
         expires_ms = float(expires_at)
-    except (TypeError, ValueError):
+    elif isinstance(expires_at, str):
+        try:
+            expires_ms = float(expires_at)
+        except ValueError:
+            dt = parse_reset_datetime(expires_at)
+            if dt is not None:
+                expires_ms = dt.timestamp() * 1000.0
+    if expires_ms is None:
         return False
     return time.time() * 1000.0 >= expires_ms - skew_seconds * 1000.0
 
 
-def agy_refresh_tokens_cli() -> None:
+def agy_refresh_tokens_cli(home: Path | None = None) -> None:
     command = shutil.which("antigravity-usage")
     if not command:
         raise RuntimeError("antigravity-usageのトークン更新に失敗しました（antigravity-usageが見つかりません）")
-    completed = subprocess.run([command, "accounts", "refresh"], capture_output=True, text=True, timeout=TIMEOUT)
+    env = None
+    if home is not None:
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env.pop("XDG_CONFIG_HOME", None)
+    completed = subprocess.run([command, "accounts", "refresh"], capture_output=True, text=True, timeout=TIMEOUT, env=env)
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or "トークンの更新に失敗しました"
         raise RuntimeError(detail)
+
+
+def agy_refresh_native_token(tokens_info: dict[str, Any]) -> dict[str, Any] | None:
+    """Refresh a native `antigravity-oauth-token` without storing OAuth client secrets in this repo."""
+    refresh_token = tokens_info.get("refreshToken")
+    if not refresh_token:
+        return None
+
+    client_id = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_SECRET")
+    if client_id and client_secret:
+        body = urllib.parse.urlencode({
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "refresh_token",
+        }).encode()
+        request = urllib.request.Request("https://oauth2.googleapis.com/token", data=body, method="POST")
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            payload = json.load(response)
+        new_token = payload.get("access_token")
+        if new_token:
+            expires_in = float(payload.get("expires_in", 3600))
+            return {
+                **tokens_info,
+                "accessToken": str(new_token),
+                "expiresAt": (time.time() + expires_in) * 1000.0,
+            }
+
+    # Try asking `agy` itself under the account's HOME to refresh its token file.
+    account_home = tokens_info.get("accountHome")
+    source_path = tokens_info.get("source")
+    agy_cmd = shutil.which("agy")
+    if agy_cmd and account_home and source_path:
+        env = dict(os.environ)
+        env["HOME"] = str(account_home)
+        env.pop("ANTIGRAVITY_APP_DATA_DIR", None)
+        subprocess.run([agy_cmd, "models"], capture_output=True, text=True, timeout=TIMEOUT, env=env)
+        reloaded = agy_parse_oauth_token_file(Path(source_path))
+        if reloaded and not agy_token_expired(reloaded):
+            return {**tokens_info, **reloaded}
+
+    # Fall back to `antigravity-usage` inside an ephemeral HOME so refreshed tokens stay in memory only.
+    if shutil.which("antigravity-usage"):
+        email = str(tokens_info.get("email") or "account@local")
+        safe_name = re.sub(r"[^a-zA-Z0-9@._-]", "_", email)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_home = Path(tmp)
+            cfg_dir = agy_config_dir(home=tmp_home)
+            acct_dir = cfg_dir / "accounts" / safe_name
+            acct_dir.mkdir(parents=True, exist_ok=True)
+            (cfg_dir / "config.json").write_text(json.dumps({"version": "2.0", "activeAccount": email}))
+            (acct_dir / "tokens.json").write_text(json.dumps({
+                "accessToken": tokens_info.get("accessToken") or "",
+                "refreshToken": refresh_token,
+                "expiresAt": 0,
+                "email": email,
+            }))
+            agy_refresh_tokens_cli(home=tmp_home)
+            refreshed = agy_read_json(acct_dir / "tokens.json")
+            if refreshed and refreshed.get("accessToken"):
+                return {
+                    **tokens_info,
+                    "accessToken": refreshed["accessToken"],
+                    "refreshToken": refreshed.get("refreshToken") or refresh_token,
+                    "expiresAt": refreshed.get("expiresAt"),
+                }
+    return None
 
 
 def agy_request_json(endpoint: str, token: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -602,21 +859,54 @@ def agy_build_windows(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return consolidate_agy_rows(windows)
 
 
-def agy_usage_from_api(tokens_info: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+def agy_refresh_tokens(tokens_info: dict[str, Any], account: str | None = None) -> dict[str, Any]:
+    """Refresh an Antigravity token via native or `antigravity-usage` flow."""
+    if tokens_info.get("tokenKind") == "native":
+        refreshed = agy_refresh_native_token(tokens_info)
+        if refreshed:
+            return refreshed
+        return tokens_info
+    home_str = tokens_info.get("accountHome")
+    cli_home = Path(home_str) if isinstance(home_str, str) and home_str else None
+    if cli_home is not None and agy_base_home() == cli_home:
+        agy_refresh_tokens_cli()
+    else:
+        agy_refresh_tokens_cli(home=cli_home)
+    reloaded = agy_load_tokens(account=account)
+    return {**tokens_info, **reloaded} if reloaded else tokens_info
+
+
+def agy_usage_from_api(
+    tokens_info: dict[str, Any], now: datetime | None = None, account: str | None = None
+) -> dict[str, Any]:
     token = tokens_info.get("accessToken")
     if (not token or agy_token_expired(tokens_info)) and tokens_info.get("refreshToken"):
-        agy_refresh_tokens_cli()
-        refreshed = agy_load_tokens()
-        if refreshed:
-            tokens_info = refreshed
+        try:
+            tokens_info = agy_refresh_tokens(tokens_info, account=account)
+        except Exception:
+            pass
         token = tokens_info.get("accessToken")
-    if not token:
-        raise RuntimeError("Antigravityのアクセストークンがありません（antigravity-usage loginを実行してください）")
+    if not token or agy_token_expired(tokens_info):
+        raise RuntimeError("Antigravityのアクセストークンが有効期限切れです（agy login または antigravity-usage loginを実行してください）")
 
-    code_assist = agy_request_json("/v1internal:loadCodeAssist", str(token), {"metadata": AGY_CLIENT_METADATA})
-    project_id = agy_extract_project_id(code_assist, fallback=tokens_info.get("projectId"))
-    models_body = {"project": project_id} if project_id else {}
-    models_resp = agy_request_json("/v1internal:fetchAvailableModels", str(token), models_body)
+    def fetch_models(access_token: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        ca = agy_request_json("/v1internal:loadCodeAssist", access_token, {"metadata": AGY_CLIENT_METADATA})
+        project_id = agy_extract_project_id(ca, fallback=tokens_info.get("projectId"))
+        models_body = {"project": project_id} if project_id else {}
+        models_resp = agy_request_json("/v1internal:fetchAvailableModels", access_token, models_body)
+        return ca, models_resp
+
+    try:
+        code_assist, models_resp = fetch_models(str(token))
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401 or not tokens_info.get("refreshToken"):
+            raise
+        tokens_info = agy_refresh_tokens(tokens_info, account=account)
+        refreshed_token = tokens_info.get("accessToken")
+        if not refreshed_token:
+            raise
+        code_assist, models_resp = fetch_models(str(refreshed_token))
+
     models_map = models_resp.get("models") if isinstance(models_resp.get("models"), dict) else {}
 
     normalized: list[dict[str, Any]] = []
@@ -636,39 +926,67 @@ def agy_usage_from_api(tokens_info: dict[str, Any], now: datetime | None = None)
         })
 
     windows = agy_build_windows(normalized)
-    return {"service": "agy", "ok": True, "plan": agy_extract_plan(code_assist), "windows": windows}
+    result: dict[str, Any] = {"service": "agy", "ok": True, "plan": agy_extract_plan(code_assist), "windows": windows}
+    label = tokens_info.get("accountLabel") or account or agy_account_label(tokens_info)
+    if label:
+        result["account"] = label
+    if tokens_info.get("email"):
+        result["email"] = tokens_info["email"]
+    return result
 
 
-def agy_usage() -> dict[str, Any]:
-    tokens_info = agy_load_tokens()
+def agy_usage_for_tokens(tokens_info: dict[str, Any], account: str | None = None) -> dict[str, Any]:
+    label = tokens_info.get("accountLabel") or account or (
+        agy_account_label(tokens_info) if tokens_info.get("email") else None
+    )
+    try:
+        return agy_usage_from_api(tokens_info, account=account)
+    except urllib.error.HTTPError as exc:
+        msg = "Antigravityの認証が切れています（agy login または antigravity-usage loginを実行してください）" if exc.code in (401, 403) else f"APIエラー HTTP {exc.code}"
+        res = error("agy", msg)
+    except Exception as exc:
+        res = error("agy", str(exc))
+    if label:
+        res["account"] = label
+    return res
+
+
+def agy_usage(account: str | None = None) -> dict[str, Any]:
+    resolved_account = resolve_agy_account(account)
+    tokens_info = agy_load_tokens(account=resolved_account)
     if tokens_info is not None:
-        try:
-            return agy_usage_from_api(tokens_info)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403):
-                return error("agy", "Antigravityの認証が切れています（antigravity-usage loginを実行してください）")
-            return error("agy", f"APIエラー HTTP {exc.code}")
-        except Exception as exc:
-            return error("agy", str(exc))
+        return agy_usage_for_tokens(tokens_info, account=resolved_account)
 
     modern_command = shutil.which("antigravity-usage")
     if modern_command:
         try:
+            cmd = [modern_command, "quota", "--json"]
+            if resolved_account:
+                cmd.extend(["--account", resolved_account])
             completed = subprocess.run(
-                [modern_command, "quota", "--json"], capture_output=True, text=True, timeout=TIMEOUT
+                cmd, capture_output=True, text=True, timeout=TIMEOUT
             )
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "使用量の取得に失敗しました")
             raw = json.loads(completed.stdout)
             models = raw.get("models", []) if isinstance(raw, dict) else []
             windows = agy_build_windows(models)
-            return {"service": "agy", "ok": True, "plan": raw.get("planType"), "windows": windows}
+            result = {"service": "agy", "ok": True, "plan": raw.get("planType"), "windows": windows}
+            if resolved_account:
+                result["account"] = resolved_account
+            return result
         except Exception as exc:
-            return error("agy", str(exc))
+            res = error("agy", str(exc))
+            if resolved_account:
+                res["account"] = resolved_account
+            return res
 
     command = shutil.which("agy-usage")
     if not command:
-        return error("agy", "antigravity-usageが見つかりません（READMEのセットアップを実行してください）")
+        res = error("agy", "Antigravityの認証情報が見つかりません（agy login または antigravity-usage loginを実行してください）")
+        if resolved_account:
+            res["account"] = resolved_account
+        return res
     try:
         completed = subprocess.run([command, "json"], capture_output=True, text=True, timeout=TIMEOUT)
         if completed.returncode != 0:
@@ -680,6 +998,17 @@ def agy_usage() -> dict[str, Any]:
         return {"service": "agy", "ok": True, "data": raw}
     except Exception as exc:
         return error("agy", str(exc))
+
+
+def agy_usages(account: str | None = None) -> list[dict[str, Any]]:
+    """Return usage results for the selected account, or all discovered agy accounts."""
+    resolved_account = resolve_agy_account(account)
+    if resolved_account:
+        return [agy_usage(account=resolved_account)]
+    accounts = agy_discover_accounts()
+    if not accounts:
+        return [agy_usage()]
+    return [agy_usage_for_tokens(tokens, account=label) for label, tokens in accounts]
 
 
 def grok_number(value: Any) -> float | None:
@@ -1037,6 +1366,8 @@ def capacity_text(service: str, plan: Any) -> str:
             return "AI Pro"
         if "pro" in normalized:
             return "Pro 1x"
+        if "starter" in normalized:
+            return "Starter"
         if "free" in normalized:
             return "Free"
         if "ultra" in normalized:
@@ -1303,14 +1634,26 @@ def render_table(headers: tuple[str, ...], rows: list[Any], aligns: tuple[str, .
     return "\n".join(out)
 
 
+def display_service_name(result: dict[str, Any], service_counts: dict[str, int]) -> str:
+    service = str(result["service"])
+    account = result.get("account")
+    if account and service_counts.get(service, 0) > 1:
+        return f"{service} ({account})"
+    return service
+
+
 def table_rows(results: list[dict[str, Any]]) -> tuple[list[Any], dict[str, list[float]]]:
     rows: list[Any] = []
     service_scores: dict[str, list[float]] = {}
+    service_counts: dict[str, int] = {}
+    for result in results:
+        service_counts[result["service"]] = service_counts.get(result["service"], 0) + 1
     for result in results:
         if rows:
             rows.append(ROW_SEPARATOR)
+        service_label = display_service_name(result, service_counts)
         if not result["ok"]:
-            cells = (result["service"], "ERROR", "-", "-", "-", "-", "-", result["error"])
+            cells = (service_label, "ERROR", "-", "-", "-", "-", "-", result["error"])
             rows.append((cells, {1: "red", ESTIMATE_COLUMN: "red"}))
             continue
         plan = capacity_text(result["service"], result.get("plan"))
@@ -1319,7 +1662,7 @@ def table_rows(results: list[dict[str, Any]]) -> tuple[list[Any], dict[str, list
             windows = [{"name": n, "remaining_percent": p, "resets_at": r} for n, p, r in flatten_agy(result["data"])]
             windows = consolidate_agy_rows(windows)
         if not windows:
-            rows.append(((result["service"], "取得済み（表示可能な枠なし）", plan, "-", "-", "-", "-", "-"), {}))
+            rows.append(((service_label, "取得済み（表示可能な枠なし）", plan, "-", "-", "-", "-", "-"), {}))
         for row in windows:
             remaining = row.get("remaining_percent")
             if remaining is None:
@@ -1330,12 +1673,12 @@ def table_rows(results: list[dict[str, Any]]) -> tuple[list[Any], dict[str, list
                 used_text = f"{100.0 - remaining:.{precision}f}%"
                 remaining_text = f"{remaining:.{precision}f}%"
                 estimate, points = estimated_left_text(result["service"], result.get("plan"), remaining, str(row["name"]))
-                service_scores.setdefault(result["service"], []).append(points)
+                service_scores.setdefault(service_label, []).append(points)
                 if row.get("unit") == "credits" and row.get("remaining") is not None and row.get("entitlement") is not None:
                     estimate = f"{row['remaining']:,.1f} / {row['entitlement']:,.1f} cr"
             pace = pace_text(row)
             cells = (
-                result["service"], str(row["name"]), plan, used_text, remaining_text,
+                service_label, str(row["name"]), plan, used_text, remaining_text,
                 reset_text(row.get("resets_at")), pace, estimate,
             )
             level = percent_severity(remaining)
@@ -1353,11 +1696,15 @@ def print_table(results: list[dict[str, Any]], use_color: bool | None = None, no
     use_color = color_enabled() if use_color is None else use_color
     rows, service_scores = table_rows(results)
     print(render_table(TABLE_HEADERS, rows, TABLE_ALIGNS, use_color))
+    service_counts: dict[str, int] = {}
+    for result in results:
+        service_counts[result["service"]] = service_counts.get(result["service"], 0) + 1
     failures = [result for result in results if not result["ok"]]
     if failures:
         print("\nエラー詳細:")
         for result in failures:
-            print(f"  {paint(result['service'], 'red' if use_color else None)}: {result['error']}")
+            service_label = display_service_name(result, service_counts)
+            print(f"  {paint(service_label, 'red' if use_color else None)}: {result['error']}")
     scores = {service: sum(values) / len(values) for service, values in service_scores.items() if values}
     if len(scores) > 1:
         ranking = " > ".join(f"{service} ({score:.0f}pt)" for service, score in sorted(scores.items(), key=lambda item: item[1], reverse=True))
@@ -1370,21 +1717,30 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="機械可読なJSONを出力")
     parser.add_argument("--service", choices=("codex", "claude", "copilot", "agy", "grok"), action="append", help="対象を限定（複数指定可）")
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="残量警告の色付け（既定: 端末出力時のみ）")
+    parser.add_argument("--agy-account", help="agyの対象アカウント名（例: sub）")
     args = parser.parse_args()
     selected = args.service or ["codex", "claude", "copilot", "agy", "grok"]
     checkers = {
-        "codex": codex_usage,
-        "claude": claude_usage,
-        "copilot": copilot_usage,
-        "agy": agy_usage,
-        "grok": grok_usage,
+        "codex": lambda: [codex_usage()],
+        "claude": lambda: [claude_usage()],
+        "copilot": lambda: [copilot_usage()],
+        "agy": lambda: agy_usages(account=args.agy_account),
+        "grok": lambda: [grok_usage()],
     }
-    results = [checkers[name]() for name in selected]
+    results: list[dict[str, Any]] = []
+    for name in selected:
+        results.extend(checkers[name]())
     plans = load_local_config().get("plans", {})
     if isinstance(plans, dict):
         for result in results:
-            if result.get("ok") and plans.get(result["service"]):
-                result["plan"] = plans[result["service"]]
+            if result.get("ok"):
+                account = result.get("account")
+                override = (
+                    (account and (plans.get(f"{result['service']}:{account}") or plans.get(account)))
+                    or plans.get(result["service"])
+                )
+                if override:
+                    result["plan"] = override
     now = datetime.now().astimezone()
     if args.json:
         print(json.dumps({"checked_at": now.isoformat(), "services": results}, ensure_ascii=False, indent=2))

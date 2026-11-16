@@ -4,17 +4,12 @@ Codex、Claude Code、GitHub Copilot、Antigravity CLI (`agy`)、Grok Build (`gr
 
 ## セットアップ
 
-本体はPython 3.9以上で動作します。agyの取得だけは、現行CLIのローカル接続に対応する補助CLI（Node.js 18以上）を一度導入します。
+本体はPython 3.9以上で動作します。
+
+Antigravity CLI (`agy`) でログイン済み（`~/.gemini/antigravity-cli/antigravity-oauth-token`）または補助CLI `antigravity-usage` でログイン済みであれば使用枠を取得できます。メインアカウントに加えて `~/.agy-accounts/<account>` 配下のアカウントも自動検出し、通常実行で表に並べて表示します（`--agy-account <account>` や環境変数 `AGY_ACCOUNT` で単一アカウントへの絞り込みも可能です）。
 
 ```sh
 chmod +x usage_check.py
-npm install -g antigravity-usage
-```
-
-Antigravity IDEが起動中なら、補助CLIがローカル接続から使用枠を取得します。CLI版のagyだけを使う場合は、補助CLIにも一度ログインしてください。
-
-```sh
-antigravity-usage login
 ```
 
 Grokは Grok Build CLI (`@xai-official/grok`) のログイン情報（`~/.grok/auth.json`）をそのまま利用します。未ログインなら一度ログインしてください。
@@ -56,8 +51,9 @@ ai-usage
 - GitHub Copilot: GitHub CLIの認証を使い、GitHubの内部利用枠APIから月次のAI Credits（旧課金方式ではPremium requests）、Chat、Completionsを取得
   - AI Credits方式では小数付き残量を優先し、割合は小数2桁、`EST. LEFT` は実残量 / 月次枠（`cr`）を表示します。Pro+はAPIの契約SKUで判別します。
   - 無制限の枠は表示せず、上限がある枠だけを表示します。このAPIは非公開仕様のため、GitHub側の変更で利用できなくなる可能性があります。
-- agy: `antigravity-usage login` で保存された OAuth トークンを使い、`daily-cloudcode-pa.googleapis.com` の Cloud Code API（`loadCodeAssist` / `fetchAvailableModels`）を直接参照（トークン未保存時は `antigravity-usage quota --json` へフォールバック）
+- agy: Antigravity CLI (`agy`) 本体のログイン情報（`antigravity-oauth-token`）または `antigravity-usage login` で保存された OAuth トークンを使い、`daily-cloudcode-pa.googleapis.com` の Cloud Code API（`loadCodeAssist` / `fetchAvailableModels`）を直接参照（トークン未保存時は `antigravity-usage quota --json` へフォールバック）
   - Gemini系モデルはすべて同一のクォータ枠（共通プール）を共有するため、「Gemini (共通枠)」として1行に集約して表示します（Gemini 3.8 Flashなど新モデルが追加されても自動で集約されます）。残量APIが数値を返さない場合はREMAINは「不明」となります。
+  - 通常実行時はメインアカウントと `~/.agy-accounts/<account>` 配下のアカウントをすべて並べて表示し、環境変数 `AGY_ACCOUNT`・CLIオプション `--agy-account <account>`・`.usage_check.local.json` で特定アカウントへの絞り込みにも対応しています。
 - Grok: Grok Build CLIのOAuth認証（`~/.grok/auth.json`）で課金APIと契約APIを参照。アクセストークンが期限切れならリフレッシュトークンで自動更新します（更新後のトークンはメモリ上のみで、ファイルへは書き戻しません）
 
 未ログインやCLI未導入のサービスはERROR行になり、取得できた他サービスはそのまま表示されます。長いエラーメッセージは表内では末尾を省略し、表の下の「エラー詳細」に全文を出します。
