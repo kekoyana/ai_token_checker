@@ -401,8 +401,12 @@ def consolidate_claude_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def consolidate_agy_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """agyのGemini系・Claude系をそれぞれ共通枠にまとめる。"""
-    return consolidate_claude_rows(consolidate_gemini_rows(rows))
+    """agyのGemini系・Claude系をそれぞれ共通枠にまとめ、API応答順に依存しない固定順（Gemini→Claude→その他は名前順）に並べる。"""
+    def order(row: dict[str, Any]) -> tuple[int, str]:
+        group = 0 if is_gemini_entry(row) else 1 if is_claude_entry(row) else 2
+        return group, str(row.get("name") or "")
+
+    return sorted(consolidate_claude_rows(consolidate_gemini_rows(rows)), key=order)
 
 
 def consolidate_shared_rows(

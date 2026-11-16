@@ -14,6 +14,7 @@ from usage_check import (
     ANSI_RESET,
     COPILOT_USAGE_URL,
     GROK_SUBSCRIPTIONS_URL,
+    agy_build_windows,
     agy_load_tokens,
     agy_usage,
     display_width,
@@ -268,13 +269,23 @@ class AgyUsageTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         windows = result["windows"]
         self.assertEqual(len(windows), 3)
-        self.assertEqual(windows[0]["name"], "Claude (共通枠)")
-        self.assertEqual(windows[0]["remaining_percent"], 80.0)
-        self.assertEqual(windows[0]["resets_at"], "2026-09-03T06:40:00Z")
-        self.assertEqual(windows[1]["name"], "Gemini (共通枠)")
-        self.assertEqual(windows[1]["remaining_percent"], 95.0)
-        self.assertEqual(windows[1]["resets_at"], "2026-09-03T06:41:42Z")
+        self.assertEqual(windows[0]["name"], "Gemini (共通枠)")
+        self.assertEqual(windows[0]["remaining_percent"], 95.0)
+        self.assertEqual(windows[0]["resets_at"], "2026-09-03T06:41:42Z")
+        self.assertEqual(windows[1]["name"], "Claude (共通枠)")
+        self.assertEqual(windows[1]["remaining_percent"], 80.0)
+        self.assertEqual(windows[1]["resets_at"], "2026-09-03T06:40:00Z")
         self.assertEqual(windows[2]["name"], "GPT-OSS 120B (Medium)")
+
+    def test_agy_windows_order_is_independent_of_api_order(self):
+        models = [
+            {"label": "GPT-OSS 120B (Medium)", "remainingPercentage": 1.0, "resetTime": "2026-09-03T06:42:38Z"},
+            {"label": "Gemini 3 Flash", "modelId": "gemini-3-flash", "remainingPercentage": 0.95, "resetTime": "2026-09-03T06:41:42Z"},
+            {"label": "Claude Opus 4.6 (Thinking)", "remainingPercentage": 1.0, "resetTime": "2026-09-03T06:42:38Z"},
+        ]
+        expected = ["Gemini (共通枠)", "Claude (共通枠)", "GPT-OSS 120B (Medium)"]
+        self.assertEqual([w["name"] for w in agy_build_windows(models)], expected)
+        self.assertEqual([w["name"] for w in agy_build_windows(models[::-1])], expected)
 
     def test_load_tokens_reads_active_account(self):
         with tempfile.TemporaryDirectory() as tmp:
