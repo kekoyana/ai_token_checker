@@ -52,7 +52,7 @@ ai-usage
   - AI Credits方式では小数付き残量を優先し、割合は小数2桁、`EST. LEFT` は実残量 / 月次枠（`cr`）を表示します。Pro+はAPIの契約SKUで判別します。
   - 無制限の枠は表示せず、上限がある枠だけを表示します。このAPIは非公開仕様のため、GitHub側の変更で利用できなくなる可能性があります。
 - agy: Antigravity CLI (`agy`) 本体のログイン情報（`antigravity-oauth-token`）または `antigravity-usage login` で保存された OAuth トークンを使い、`daily-cloudcode-pa.googleapis.com` の Cloud Code API（`loadCodeAssist` / `fetchAvailableModels`）を直接参照（トークン未保存時は `antigravity-usage quota --json` へフォールバック）
-  - Gemini系モデルはすべて同一のクォータ枠（共通プール）を共有するため、「Gemini (共通枠)」として1行に集約して表示します（Gemini 3.8 Flashなど新モデルが追加されても自動で集約されます）。残量APIが数値を返さない場合はREMAINは「不明」となります。
+  - Gemini系モデルはすべて同一のクォータ枠（共通プール）を共有するため、「Gemini (共通枠)」として1行に集約して表示します（Gemini 3.8 Flashなど新モデルが追加されても自動で集約されます）。APIはリセット時刻だけを返して残量キーを省略することがあり（値0のフィールドが省略されるため）、その場合は枯渇（0%）として表示します。
   - 通常実行時はメインアカウントと `~/.agy-accounts/<account>` 配下のアカウントをすべて並べて表示し、環境変数 `AGY_ACCOUNT`・CLIオプション `--agy-account <account>`・`.usage_check.local.json` で特定アカウントへの絞り込みにも対応しています。
 - Grok: Grok Build CLIのOAuth認証（`~/.grok/auth.json`）で課金APIと契約APIを参照。アクセストークンが期限切れならリフレッシュトークンで自動更新します（更新後のトークンはメモリ上のみで、ファイルへは書き戻しません）
 

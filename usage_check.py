@@ -839,8 +839,9 @@ def agy_build_windows(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if model.get("isExhausted"):
             remaining: float | None = 0.0
         elif raw_remaining is None:
-            # Gemini系はremainingPercentageを返さない場合がある。枠の存在とリセット時刻だけ載せる。
-            remaining = None
+            # APIはprotobuf JSONのため、値が0のremainingFractionは省略される。
+            # リセット時刻だけ返る枠（Gemini系）は枯渇として扱う。
+            remaining = 0.0
         else:
             remaining = max(0.0, min(100.0, float(raw_remaining) * 100.0))
         name = model.get("label") or model.get("modelId") or model.get("id") or "model"
@@ -1498,6 +1499,8 @@ def pace_text(row: dict[str, Any], now: datetime | None = None) -> str:
         return "満タン"
     # 残量が少ない事実はペース推定より優先する。ペース推定はウィンドウ長に
     # 依存するため、そこを誤ると残り数%の枠に安心ラベルが付いてしまう。
+    if remaining <= 0.0:
+        return "枯渇"
     if remaining <= 10.0:
         return "枯渇寸前"
     if remaining <= 25.0:
@@ -1549,7 +1552,7 @@ ANSI_RESET = "\033[0m"
 # 「残りわずか」の境界。25%以下で黄、10%以下で赤。
 WARN_PERCENT = 25.0
 CRITICAL_PERCENT = 10.0
-CRITICAL_PACE = ("枯渇寸前",)
+CRITICAL_PACE = ("枯渇", "枯渇寸前")
 WARN_PACE = ("残りわずか", "枯渇懸念", "やや速い")
 
 

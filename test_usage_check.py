@@ -199,8 +199,8 @@ class AgyUsageTests(unittest.TestCase):
     @patch("usage_check.agy_load_tokens", return_value=None)
     @patch("usage_check.subprocess.run")
     @patch("usage_check.shutil.which", return_value="/usr/local/bin/antigravity-usage")
-    def test_models_without_remaining_percentage_are_kept(self, _which, run, _tokens):
-        """Gemini系はremainingPercentageを返さない場合がある。枠ごと消えると枯渇に気付けない。"""
+    def test_models_without_remaining_percentage_are_exhausted(self, _which, run, _tokens):
+        """値0のフィールドはAPIが省略する。リセット時刻だけ返る枠は枯渇として枠ごと残す。"""
         run.return_value.returncode = 0
         run.return_value.stdout = json.dumps({
             "models": [
@@ -216,10 +216,10 @@ class AgyUsageTests(unittest.TestCase):
         names = [w["name"] for w in result["windows"]]
         self.assertIn("Gemini (共通枠)", names)
         gemini = next(w for w in result["windows"] if w["name"] == "Gemini (共通枠)")
-        self.assertIsNone(gemini["remaining_percent"])
+        self.assertEqual(gemini["remaining_percent"], 0.0)
         self.assertEqual(gemini["resets_at"], "2026-09-02T03:40:23Z")
         # 5hウィンドウ前提のペース計算を62hの枠に適用しない
-        self.assertIsNone(gemini["window_minutes"])
+        self.assertNotEqual(gemini["window_minutes"], 300)
 
     @patch("usage_check.agy_load_tokens", return_value=None)
     @patch("usage_check.subprocess.run")
