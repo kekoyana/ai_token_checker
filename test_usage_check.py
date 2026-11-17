@@ -16,6 +16,7 @@ from usage_check import (
     GROK_SUBSCRIPTIONS_URL,
     agy_build_windows,
     agy_discover_accounts,
+    agy_extract_plan,
     agy_load_tokens,
     agy_parse_oauth_token_file,
     agy_refresh_native_token,
@@ -63,6 +64,7 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(capacity_text("agy", "ultra"), "Ultra (倍率不明)")
         self.assertEqual(capacity_text("agy", "AI Pro"), "AI Pro")
         self.assertEqual(capacity_text("agy", "Antigravity Starter Quota"), "Starter")
+        self.assertEqual(capacity_text("agy", "Google AI Plus"), "AI Plus")
         self.assertEqual(capacity_text("codex", "plus"), "Plus")
         self.assertEqual(capacity_text("codex", None), "不明")
         self.assertEqual(capacity_text("grok", "supergrok_heavy"), "SuperGrok Heavy")
@@ -478,6 +480,13 @@ class AgyUsageTests(unittest.TestCase):
         self.assertFalse(results[1]["ok"])
         self.assertEqual(results[1]["account"], "sub")
         self.assertIn("token expired", results[1]["error"])
+
+    def test_agy_extract_plan_reports_ai_plus_despite_starter_quota_name(self):
+        code_assist = {
+            "currentTier": {"id": "free-tier", "name": "Antigravity"},
+            "paidTier": {"id": "g1-plus-tier", "name": "Antigravity Starter Quota"},
+        }
+        self.assertEqual(agy_extract_plan(code_assist), "Google AI Plus")
 
     def test_table_rows_labels_multiple_agy_accounts_and_keeps_capacity_lookup(self):
         results = [

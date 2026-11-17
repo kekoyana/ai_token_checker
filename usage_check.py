@@ -40,7 +40,7 @@ CAPACITY_POINTS = {
     "codex": {"free": 20, "go": 50, "plus": 100, "pro": 1000, "business": 250, "enterprise": 1000, "edu": 250},
     "claude": {"free": 20, "pro": 100, "max_5x": 500, "max_20x": 2000, "team": 500, "enterprise": 1000},
     "copilot": {"free": 20, "pro": 100, "business": 250, "enterprise": 1000},
-    "agy": {"free": 20, "starter": 50, "plus": 50, "ai_pro": 100, "pro": 100, "ultra_5x": 500, "ultra_20x": 2000, "enterprise": 1000},
+    "agy": {"free": 20, "starter": 50, "plus": 50, "ai_plus": 50, "ai_pro": 100, "pro": 100, "ultra_5x": 500, "ultra_20x": 2000, "enterprise": 1000},
     "grok": {
         "free": 20,
         "x_basic": 20,
@@ -792,8 +792,15 @@ def agy_extract_project_id(code_assist: dict[str, Any], fallback: Any = None) ->
     return str(fallback) if isinstance(fallback, str) and fallback else None
 
 
+# The API names the Google AI Plus tier "Antigravity Starter Quota", so key off the tier id instead.
+AGY_TIER_ID_PLANS = {"g1-plus-tier": "Google AI Plus"}
+
+
 def agy_extract_plan(code_assist: dict[str, Any]) -> str | None:
     paid_tier = code_assist.get("paidTier") if isinstance(code_assist.get("paidTier"), dict) else {}
+    known_plan = AGY_TIER_ID_PLANS.get(str(paid_tier.get("id") or ""))
+    if known_plan:
+        return known_plan
     current_tier = code_assist.get("currentTier") if isinstance(code_assist.get("currentTier"), dict) else {}
     plan_info = code_assist.get("planInfo") if isinstance(code_assist.get("planInfo"), dict) else {}
     for value in (
@@ -1363,6 +1370,8 @@ def capacity_text(service: str, plan: Any) -> str:
             return "Ultra 20x"
         if "5x" in normalized or "ultra_100" in normalized:
             return "Ultra 5x"
+        if "ai_plus" in normalized:
+            return "AI Plus"
         if "ai_pro" in normalized:
             return "AI Pro"
         if "pro" in normalized:
