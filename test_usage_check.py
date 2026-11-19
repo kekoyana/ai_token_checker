@@ -27,7 +27,9 @@ from usage_check import (
     pace_severity,
     percent_severity,
     capacity_text,
+    claude_blocked_model_window,
     claude_credentials,
+    claude_missing_model_windows,
     claude_keychain_service,
     claude_windows,
     copilot_usage,
@@ -124,6 +126,28 @@ class FormattingTests(unittest.TestCase):
             ],
         }
         self.assertEqual([window["name"] for window in claude_windows(raw)], ["7日 Opus"])
+
+    def test_claude_blocked_model_becomes_exhausted_window(self):
+        body = json.dumps({"type": "error", "error": {
+            "type": "rate_limit_error", "message": "Usage credits are required for this model.",
+            "details": {"error_code": "credits_required", "model": "claude-fable-5-2", "model_display_name": "Fable"},
+        }})
+        window = claude_blocked_model_window("Fable", 429, {"anthropic-ratelimit-unified-reset": "1796083200"}, body)
+        self.assertEqual(window["name"], "Fable")
+        self.assertEqual(window["remaining_percent"], 0.0)
+        self.assertEqual(window["note"], "クレジット必要")
+        self.assertEqual(window["resets_at"], "2026-12-01T00:00:00+00:00")
+
+    def test_claude_blocked_model_ignores_unrelated_errors(self):
+        generic = json.dumps({"error": {"type": "rate_limit_error", "message": "Rate limited."}})
+        self.assertIsNone(claude_blocked_model_window("Fable", 429, {}, generic))
+        self.assertIsNone(claude_blocked_model_window("Fable", 401, {}, "{}"))
+        self.assertIsNone(claude_blocked_model_window("Fable", 429, {}, "not json"))
+
+    def test_claude_missing_model_probe_skips_listed_models(self):
+        with patch("usage_check.claude_probe_model") as probe:
+            self.assertEqual(claude_missing_model_windows("t", [{"name": "7日 Fable"}]), [])
+            probe.assert_not_called()
 
     def test_scoped_fable_window_falls_back_to_generic_points(self):
         self.assertEqual(estimated_left_text("claude", "max_5x", 97.0, "7日 Fable"), ("約485pt (非常に多)", 485.0))

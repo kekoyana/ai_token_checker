@@ -200,6 +200,73 @@ def claude_windows(raw: dict[str, Any]) -> list[dict[str, Any]]:
     return windows
 
 
+CLAUDE_PROBE_MODELS = {"Fable": "claude-fable-5-2"}
+
+
+def claude_blocked_model_window(display_name: str, status: int, headers: Any, body: str) -> dict[str, Any] | None:
+    """Turn a refused model request into an exhausted window row.
+
+    When a model-scoped allowance runs out (e.g. Fable switching to "usage credits required"),
+    the usage API drops the scoped entry from `limits` entirely, so the only remaining evidence is
+    the 429 that /v1/messages returns for that model.
+    """
+    if status != 429:
+        return None
+    try:
+        error_body = json.loads(body).get("error") or {}
+    except (ValueError, AttributeError):
+        return None
+    details = error_body.get("details") or {}
+    if error_body.get("type") != "rate_limit_error" or not isinstance(details, dict) or not details.get("model"):
+        return None
+    reason = "クレジット必要" if details.get("error_code") == "credits_required" else "利用上限"
+    resets_at = None
+    reset = headers.get("anthropic-ratelimit-unified-reset") if headers is not None else None
+    try:
+        resets_at = datetime.fromtimestamp(float(reset), tz=timezone.utc).isoformat() if reset else None
+    except (TypeError, ValueError):
+        resets_at = None
+    name = details.get("model_display_name") or display_name
+    return {"name": name, "remaining_percent": 0.0, "used_percent": 100.0, "resets_at": resets_at, "window_minutes": None, "note": reason}
+
+
+def claude_probe_model(token: str, display_name: str, model: str) -> dict[str, Any] | None:
+    """Send a 1-token request to see whether a model is blocked. Only used when the usage API omits it."""
+    body = json.dumps({
+        "model": model, "max_tokens": 1,
+        "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    request = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body,
+        headers={
+            "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
+            "anthropic-version": "2023-06-01", "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT):
+            return None
+    except urllib.error.HTTPError as exc:
+        return claude_blocked_model_window(display_name, exc.code, exc.headers, exc.read().decode(errors="replace"))
+    except Exception:
+        return None
+
+
+def claude_missing_model_windows(token: str, windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if os.environ.get("CLAUDE_MODEL_PROBE") == "0":
+        return []
+    found: list[dict[str, Any]] = []
+    for display_name, default_model in CLAUDE_PROBE_MODELS.items():
+        if any(str(window["name"]).split()[-1] == display_name for window in windows):
+            continue
+        model = os.environ.get(f"CLAUDE_{display_name.upper()}_MODEL", default_model)
+        window = claude_probe_model(token, display_name, model)
+        if window:
+            found.append(window)
+    return found
+
+
 def claude_usage() -> dict[str, Any]:
     try:
         credentials = claude_credentials()
@@ -213,6 +280,7 @@ def claude_usage() -> dict[str, Any]:
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             raw = json.load(response)
         windows = claude_windows(raw)
+        windows.extend(claude_missing_model_windows(token, windows))
         plan_parts = [credentials.get("subscriptionType"), credentials.get("rateLimitTier")]
         plan = " ".join(str(part) for part in plan_parts if part)
         return {"service": "claude", "ok": True, "plan": plan, "windows": windows}
@@ -1688,6 +1756,8 @@ def table_rows(results: list[dict[str, Any]]) -> tuple[list[Any], dict[str, list
                 service_scores.setdefault(service_label, []).append(points)
                 if row.get("unit") == "credits" and row.get("remaining") is not None and row.get("entitlement") is not None:
                     estimate = f"{row['remaining']:,.1f} / {row['entitlement']:,.1f} cr"
+                if row.get("note"):
+                    estimate = str(row["note"])
             pace = pace_text(row)
             cells = (
                 service_label, str(row["name"]), plan, used_text, remaining_text,

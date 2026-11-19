@@ -48,6 +48,7 @@ ai-usage
 - Codex: `codex app-server` の公式 `account/rateLimits/read` API
 - Claude Code: Claude CodeのローカルOAuth認証を使う使用量API
   - 5時間枠・7日枠に加え、応答の `limits` 配列にあるモデル別の週間枠（`7日 Fable` など）も1行ずつ表示します。Fable 5.1のような上位モデルは全体の7日枠とは別に専用の週間枠を持つため、この行で残量とリセット時刻を確認できます。
+  - Fable の枠を使い切って「使用クレジットが必要」な状態になると、使用量APIの `limits` から Fable の項目ごと消えます。そのときは Fable に1トークンだけのリクエストを送り、429 で断られた場合に `Fable` 行（残量0%・`EST. LEFT` は「クレジット必要」・RESET は応答ヘッダーの時刻）を表示します。この確認は Fable の項目が無いときだけ行います。止めるには `CLAUDE_MODEL_PROBE=0`、モデルIDを変えるには `CLAUDE_FABLE_MODEL` を設定します。
 - GitHub Copilot: GitHub CLIの認証を使い、GitHubの内部利用枠APIから月次のAI Credits（旧課金方式ではPremium requests）、Chat、Completionsを取得
   - AI Credits方式では小数付き残量を優先し、割合は小数2桁、`EST. LEFT` は実残量 / 月次枠（`cr`）を表示します。Pro+はAPIの契約SKUで判別します。
   - 無制限の枠は表示せず、上限がある枠だけを表示します。このAPIは非公開仕様のため、GitHub側の変更で利用できなくなる可能性があります。
